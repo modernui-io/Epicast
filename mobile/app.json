@@ -1,0 +1,27 @@
+{
+  "expo": {
+    "name": "EpiCast",
+    "slug": "epicast",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "backgroundColor": "#FFFFFF"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.epicast.surveillance"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#FFFFFF"
+      },
+      "package": "com.epicast.surveillance"
+    },
+    "plugins": [
+      "expo-location",
+      "expo-image-picker",
+      "expo-audio"
+    ]
+  }
+}
