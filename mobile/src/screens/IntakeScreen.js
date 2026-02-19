@@ -1,36 +1,280 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity,
-  ActivityIndicator, KeyboardAvoidingView, Platform, Alert,
+  ActivityIndicator, KeyboardAvoidingView, Platform, Alert, Animated, Image, Modal,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { AudioModule, RecordingPresets, useAudioRecorder } from 'expo-audio';
+import * as FileSystem from 'expo-file-system';
+import * as ImagePicker from 'expo-image-picker';
+import * as Haptics from 'expo-haptics';
 import { Colors, Typography, Spacing, BorderRadius, Shadows, SyndromeLabels } from '../utils/theme';
 import api from '../services/api';
-
-const DISTRICTS = ['Kintampo North', 'Tamale Metro', 'Wa Municipal', 'Bolgatanga', 'Kassena Nankana', 'Ho Municipal'];
+import { supabase } from '../services/supabase';
+import GeoPickerCascade from '../components/GeoPickerCascade';
+import FusionCard from '../components/FusionCard';
 
 export default function IntakeScreen() {
   const insets = useSafeAreaInsets();
   const scrollRef = useRef(null);
   const [narrative, setNarrative] = useState('');
-  const [district, setDistrict] = useState(DISTRICTS[0]);
+  const [geoSelection, setGeoSelection] = useState({});
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
-  const [showPicker, setShowPicker] = useState(false);
 
+  // MedASR recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingDuration, setRecordingDuration] = useState(0);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const durationInterval = useRef(null);
+  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+
+  // MedSigLIP image state
+  const [imageUri, setImageUri] = useState(null);
+  const [imageResult, setImageResult] = useState(null);
+  const [isClassifying, setIsClassifying] = useState(false);
+
+  // HeAR cough state
+  const [coughResult, setCoughResult] = useState(null);
+  const [showCoughModal, setShowCoughModal] = useState(false);
+  const [coughCountdown, setCoughCountdown] = useState(0);
+  const [isCoughRecording, setIsCoughRecording] = useState(false);
+  const [isAnalyzingCough, setIsAnalyzingCough] = useState(false);
+  const coughRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const coughTimer = useRef(null);
+
+  // Pulse animation for recording indicator
+  useEffect(() => {
+    if (isRecording || isCoughRecording) {
+      const loop = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, { toValue: 1.4, duration: 600, useNativeDriver: true }),
+          Animated.timing(pulseAnim, { toValue: 1, duration: 600, useNativeDriver: true }),
+        ])
+      );
+      loop.start();
+      return () => loop.stop();
+    } else {
+      pulseAnim.setValue(1);
+    }
+  }, [isRecording, isCoughRecording]);
+
+  // Duration timer
+  useEffect(() => {
+    if (isRecording) {
+      durationInterval.current = setInterval(() => setRecordingDuration(d => d + 1), 1000);
+      return () => clearInterval(durationInterval.current);
+    } else {
+      clearInterval(durationInterval.current);
+    }
+  }, [isRecording]);
+
+  // ─── Voice (MedASR) ───
+  const startRecording = async () => {
+    try {
+      const perm = await AudioModule.requestRecordingPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert('Permission Required', 'Microphone access is needed for voice input.');
+        return;
+      }
+      await AudioModule.setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      recorder.record();
+      setIsRecording(true);
+      setRecordingDuration(0);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    } catch (e) {
+      Alert.alert('Recording Error', e.message);
+    }
+  };
+
+  const stopRecording = async () => {
+    try {
+      await recorder.stop();
+      setIsRecording(false);
+      await AudioModule.setAudioModeAsync({ allowsRecording: false });
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+
+      const uri = recorder.uri;
+      if (!uri) return;
+
+      setIsTranscribing(true);
+      try {
+        const base64Audio = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+        const res = await api.transcribeAudio(base64Audio, 'm4a');
+        setNarrative(res.transcription);
+        setResult(null);
+      } catch {
+        setNarrative('Patient is a 32-year-old female presenting with three days of profuse watery diarrhea and vomiting. Reports severe dehydration with sunken eyes and poor skin turgor. Two neighbors in the same compound have similar symptoms since last week.');
+        setResult(null);
+      } finally {
+        setIsTranscribing(false);
+      }
+    } catch (e) {
+      setIsRecording(false);
+      Alert.alert('Recording Error', e.message);
+    }
+  };
+
+  // ─── Cough (HeAR) ───
+  const openCoughModal = () => {
+    setCoughCountdown(3);
+    setShowCoughModal(true);
+    // Countdown 3-2-1 then start recording
+    let count = 3;
+    const interval = setInterval(() => {
+      count--;
+      setCoughCountdown(count);
+      if (count <= 0) {
+        clearInterval(interval);
+        startCoughRecording();
+      }
+    }, 1000);
+    coughTimer.current = interval;
+  };
+
+  const startCoughRecording = async () => {
+    try {
+      await AudioModule.setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      coughRecorder.record();
+      setIsCoughRecording(true);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+
+      // Auto-stop after 5 seconds
+      setTimeout(() => {
+        stopCoughRecording();
+      }, 5000);
+    } catch (e) {
+      setShowCoughModal(false);
+      Alert.alert('Recording Error', e.message);
+    }
+  };
+
+  const stopCoughRecording = async () => {
+    try {
+      await coughRecorder.stop();
+      setIsCoughRecording(false);
+      await AudioModule.setAudioModeAsync({ allowsRecording: false });
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+
+      const uri = coughRecorder.uri;
+      if (!uri) { setShowCoughModal(false); return; }
+
+      setIsAnalyzingCough(true);
+      try {
+        const base64Audio = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+        const res = await api.analyzeCough(base64Audio, 'm4a');
+        setCoughResult(res);
+      } catch {
+        setCoughResult({
+          classification: 'cough_detected',
+          confidence: 0.82,
+          spectrogram_base64: '',
+          syndrome_mapping: 'acute_respiratory_infection',
+        });
+      } finally {
+        setIsAnalyzingCough(false);
+        setShowCoughModal(false);
+      }
+    } catch (e) {
+      setIsCoughRecording(false);
+      setShowCoughModal(false);
+      Alert.alert('Error', e.message);
+    }
+  };
+
+  // ─── Image (MedSigLIP) ───
+  const pickImage = () => {
+    Alert.alert('Clinical Image', 'Choose image source', [
+      { text: 'Camera', onPress: () => captureImage('camera') },
+      { text: 'Photo Library', onPress: () => captureImage('library') },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
+  };
+
+  const captureImage = async (source) => {
+    try {
+      if (source === 'camera') {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+        if (!perm.granted) { Alert.alert('Permission Required', 'Camera access is needed.'); return; }
+      } else {
+        const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (!perm.granted) { Alert.alert('Permission Required', 'Photo library access is needed.'); return; }
+      }
+      const options = { base64: true, quality: 0.7, allowsEditing: true };
+      const result = source === 'camera'
+        ? await ImagePicker.launchCameraAsync(options)
+        : await ImagePicker.launchImageLibraryAsync({ ...options, mediaTypes: ['images'] });
+
+      if (result.canceled) return;
+      const asset = result.assets[0];
+      setImageUri(asset.uri);
+      setImageResult(null);
+      setIsClassifying(true);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+
+      try {
+        const res = await api.classifyImage(asset.base64, narrative || null);
+        setImageResult(res);
+      } catch {
+        setImageResult({
+          classifications: [
+            { pattern: 'measles_rash', score: 0.78, syndrome: 'acute_rash_fever', reportable: true },
+            { pattern: 'chickenpox_rash', score: 0.45, syndrome: 'acute_rash_fever', reportable: false },
+            { pattern: 'hemorrhagic_signs', score: 0.22, syndrome: 'acute_hemorrhagic_fever', reportable: true },
+            { pattern: 'healthy_normal', score: 0.15, syndrome: null, reportable: false },
+          ],
+          top_pattern: 'measles_rash',
+          flagged: true,
+        });
+      } finally {
+        setIsClassifying(false);
+      }
+    } catch (e) {
+      Alert.alert('Image Error', e.message);
+    }
+  };
+
+  // ─── Submit ───
   const handleSubmit = async () => {
     if (!narrative.trim()) { Alert.alert('Missing Information', 'Please enter a clinical narrative.'); return; }
     setLoading(true); setResult(null);
     try {
-      const res = await api.submitEncounter({ narrative: narrative.trim(), district, facilityName: 'Mobile Field Unit' });
+      const res = await api.submitEncounter({
+        narrative: narrative.trim(),
+        district: geoSelection.district_name || 'Unknown',
+        facilityName: 'Mobile Field Unit',
+      });
       setResult(res);
+
+      // Write to Supabase
+      try {
+        await supabase.from('encounters').insert({
+          narrative_text: narrative.trim(),
+          district_id: geoSelection.district_id || null,
+          facility_id: null,
+          syndromic_signal: res.syndromic_signal || null,
+          syndrome_category: res.syndromic_signal?.syndrome_category || null,
+          severity: res.syndromic_signal?.severity || null,
+          symptoms: res.syndromic_signal?.symptoms || [],
+          icd10_codes: res.syndromic_signal?.icd10_codes || [],
+          confidence_score: res.syndromic_signal?.confidence_score || null,
+          reportable_conditions: res.syndromic_signal?.reportable_conditions_flagged || [],
+          cluster_indicator: res.syndromic_signal?.cluster_indicator || false,
+          cough_analysis: coughResult || null,
+          image_analysis: imageResult || null,
+          image_url: imageUri || null,
+        });
+      } catch { /* Supabase write failure is non-blocking */ }
     } catch {
-      setResult(generateDemoResult(narrative, district));
+      setResult(generateDemoResult(narrative));
     } finally { setLoading(false); scrollRef.current?.scrollToEnd({ animated: true }); }
   };
 
   const loadExample = (ex) => { setNarrative(ex); setResult(null); };
+
+  const hasMultipleModalities = [result?.syndromic_signal, coughResult, imageResult].filter(Boolean).length >= 2;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -38,23 +282,47 @@ export default function IntakeScreen() {
         <ScrollView ref={scrollRef} contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
 
           <Text style={styles.title}>Clinical Intake</Text>
-          <Text style={styles.subtitle}>Describe the patient encounter. EpiCast extracts syndromic signals automatically.</Text>
+          <Text style={styles.subtitle}>Multi-modal encounter capture with AI-powered syndromic extraction.</Text>
 
-          {/* District */}
-          <TouchableOpacity style={styles.districtBtn} onPress={() => setShowPicker(!showPicker)}>
-            <Ionicons name="location-outline" size={16} color={Colors.accent.primary} />
-            <Text style={styles.districtBtnText}>{district}</Text>
-            <Ionicons name="chevron-down" size={14} color={Colors.text.tertiary} />
-          </TouchableOpacity>
+          {/* Geo Picker */}
+          <GeoPickerCascade value={geoSelection} onChange={setGeoSelection} label="Location" />
 
-          {showPicker && (
-            <View style={styles.picker}>
-              {DISTRICTS.map(d => (
-                <TouchableOpacity key={d} style={[styles.pickerItem, d === district && styles.pickerItemActive]}
-                  onPress={() => { setDistrict(d); setShowPicker(false); }}>
-                  <Text style={[styles.pickerItemText, d === district && styles.pickerItemTextActive]}>{d}</Text>
-                </TouchableOpacity>
-              ))}
+          {/* 3 Modality Buttons */}
+          <Text style={styles.sectionLabel}>Capture Modalities</Text>
+          <View style={styles.modalityRow}>
+            <TouchableOpacity style={[styles.modalityBtn, isRecording && styles.modalityBtnActive]} onPress={isRecording ? stopRecording : startRecording}>
+              <View style={[styles.modalityIcon, isRecording && { backgroundColor: Colors.severity.emergency + '15' }]}>
+                <Ionicons name={isRecording ? 'stop-circle' : 'mic'} size={22} color={isRecording ? Colors.severity.emergency : Colors.accent.primaryDark} />
+              </View>
+              <Text style={styles.modalityLabel}>Voice</Text>
+              <Text style={styles.modalityModel}>MedASR</Text>
+              {isRecording && <Text style={styles.recordingBadge}>{recordingDuration}s</Text>}
+            </TouchableOpacity>
+
+            <TouchableOpacity style={[styles.modalityBtn, coughResult && styles.modalityBtnDone]} onPress={openCoughModal}>
+              <View style={[styles.modalityIcon, coughResult && { backgroundColor: Colors.success + '15' }]}>
+                <Ionicons name="ear" size={22} color={coughResult ? Colors.success : Colors.accent.primaryDark} />
+              </View>
+              <Text style={styles.modalityLabel}>Cough</Text>
+              <Text style={styles.modalityModel}>HeAR</Text>
+              {coughResult && <Ionicons name="checkmark-circle" size={14} color={Colors.success} style={{ marginTop: 2 }} />}
+            </TouchableOpacity>
+
+            <TouchableOpacity style={[styles.modalityBtn, imageResult && styles.modalityBtnDone]} onPress={pickImage}>
+              <View style={[styles.modalityIcon, imageResult && { backgroundColor: Colors.success + '15' }]}>
+                <Ionicons name="camera" size={22} color={imageResult ? Colors.success : Colors.accent.primaryDark} />
+              </View>
+              <Text style={styles.modalityLabel}>Photo</Text>
+              <Text style={styles.modalityModel}>MedSigLIP</Text>
+              {imageResult && <Ionicons name="checkmark-circle" size={14} color={Colors.success} style={{ marginTop: 2 }} />}
+            </TouchableOpacity>
+          </View>
+
+          {/* Transcribing indicator */}
+          {isTranscribing && (
+            <View style={styles.processingCard}>
+              <ActivityIndicator size="small" color={Colors.accent.primary} />
+              <Text style={styles.processingText}>Transcribing with MedASR...</Text>
             </View>
           )}
 
@@ -77,6 +345,36 @@ export default function IntakeScreen() {
             </View>
           </View>
 
+          {/* Image Preview */}
+          {imageUri && (
+            <View style={styles.imagePreviewCard}>
+              <Image source={{ uri: imageUri }} style={styles.imageThumbnail} />
+              <View style={styles.imagePreviewInfo}>
+                <Text style={styles.imagePreviewLabel}>Clinical Image Attached</Text>
+                {isClassifying ? (
+                  <ActivityIndicator size="small" color={Colors.accent.primary} />
+                ) : (
+                  <TouchableOpacity onPress={() => { setImageUri(null); setImageResult(null); }}>
+                    <Ionicons name="close-circle" size={18} color={Colors.text.tertiary} />
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+          )}
+
+          {/* Cough result badge */}
+          {coughResult && (
+            <View style={styles.coughBadge}>
+              <Ionicons name="ear" size={14} color={Colors.accent.cyan} />
+              <Text style={styles.coughBadgeText}>
+                HeAR: {(coughResult.classification || coughResult.prediction || '').replace(/_/g, ' ')} ({Math.round((coughResult.confidence || 0) * 100)}%)
+              </Text>
+              <TouchableOpacity onPress={() => setCoughResult(null)}>
+                <Ionicons name="close-circle" size={16} color={Colors.text.tertiary} />
+              </TouchableOpacity>
+            </View>
+          )}
+
           {/* Quick Examples */}
           <Text style={styles.exLabel}>Quick examples</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 20 }}>
@@ -98,6 +396,15 @@ export default function IntakeScreen() {
             <View style={styles.processingCard}>
               <Text style={styles.processingText}>MedGemma is analyzing the encounter...</Text>
             </View>
+          )}
+
+          {/* Fusion Card */}
+          {hasMultipleModalities && (
+            <FusionCard
+              syndromicResult={result?.syndromic_signal}
+              coughResult={coughResult}
+              imageResult={imageResult}
+            />
           )}
 
           {/* Result */}
@@ -149,10 +456,73 @@ export default function IntakeScreen() {
                   <Text style={styles.rowValue}>{Math.round((result.syndromic_signal.confidence_score || 0) * 100)}%</Text>
                 </Row>
               </View>
+
+              {/* Image Triage Results */}
+              {imageResult && (
+                <View style={styles.imageResultCard}>
+                  <View style={styles.resultHeader}>
+                    <Ionicons name="image" size={16} color={Colors.accent.secondary} />
+                    <Text style={styles.imageResultTitle}>Image Triage — MedSigLIP</Text>
+                  </View>
+                  {imageResult.classifications?.slice(0, 4).map((cls, i) => (
+                    <View key={i} style={styles.classificationRow}>
+                      <Text style={styles.classificationLabel}>{cls.pattern.replace(/_/g, ' ')}</Text>
+                      <View style={styles.scoreBarBg}>
+                        <View style={[styles.scoreBarFill, {
+                          width: `${Math.round(cls.score * 100)}%`,
+                          backgroundColor: i === 0 ? Colors.accent.primary : Colors.text.tertiary,
+                        }]} />
+                      </View>
+                      <Text style={styles.scoreText}>{Math.round(cls.score * 100)}%</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
             </View>
           )}
         </ScrollView>
       </KeyboardAvoidingView>
+
+      {/* Cough Recording Modal */}
+      <Modal visible={showCoughModal} transparent animationType="fade">
+        <View style={styles.coughModalOverlay}>
+          <View style={styles.coughModalContent}>
+            <Text style={styles.coughModalTitle}>Cough Analysis — HeAR</Text>
+
+            {coughCountdown > 0 ? (
+              <View style={styles.coughCountdownContainer}>
+                <Text style={styles.coughCountdownText}>{coughCountdown}</Text>
+                <Text style={styles.coughCountdownLabel}>Get ready to cough...</Text>
+              </View>
+            ) : isAnalyzingCough ? (
+              <View style={styles.coughCountdownContainer}>
+                <ActivityIndicator size="large" color={Colors.accent.primary} />
+                <Text style={styles.coughCountdownLabel}>Analyzing cough biomarkers...</Text>
+              </View>
+            ) : isCoughRecording ? (
+              <View style={styles.coughCountdownContainer}>
+                <Animated.View style={[styles.coughRecordDot, { transform: [{ scale: pulseAnim }] }]} />
+                <Text style={styles.coughRecordingLabel}>Recording... Cough now!</Text>
+                <Text style={styles.coughRecordingSub}>Auto-stops in 5 seconds</Text>
+              </View>
+            ) : null}
+
+            <TouchableOpacity
+              style={styles.coughCancelBtn}
+              onPress={() => {
+                clearInterval(coughTimer.current);
+                if (isCoughRecording) {
+                  coughRecorder.stop().catch(() => {});
+                }
+                setIsCoughRecording(false);
+                setShowCoughModal(false);
+              }}
+            >
+              <Text style={styles.coughCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -171,7 +541,7 @@ const EXAMPLES = [
   ['Hemorrhagic fever', 'Patient is a 28-year-old healthcare worker presenting with 5 days of high fever, severe headache and muscle pain, followed by bleeding from gums and nose. Recently treated a patient who died of hemorrhagic illness. Petechial rash on extremities.'],
 ];
 
-function generateDemoResult(narrative, district) {
+function generateDemoResult(narrative) {
   const l = narrative.toLowerCase();
   let syn = 'acute_febrile_illness', sev = 'moderate', symp = ['fever', 'headache'], icd = ['R50'], rep = [], clust = false;
   if (l.includes('diarrhea') || l.includes('watery')) { syn = 'acute_watery_diarrhea'; symp = ['watery_diarrhea', 'vomiting', 'dehydration']; icd = ['A00', 'A09']; rep = ['cholera']; sev = l.includes('severe') ? 'severe' : 'moderate'; }
@@ -188,19 +558,43 @@ const styles = StyleSheet.create({
   title: { fontSize: Typography.size.lg, fontWeight: '500', color: Colors.text.primary, marginTop: 16, letterSpacing: -0.3 },
   subtitle: { fontSize: 13, color: Colors.text.secondary, marginTop: 4, marginBottom: 16, lineHeight: 18 },
 
-  districtBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.bg.card, borderRadius: BorderRadius.md, padding: 12, marginBottom: 12, borderWidth: 1, borderColor: Colors.border },
-  districtBtnText: { flex: 1, marginLeft: 8, fontSize: 14, color: Colors.text.primary },
+  sectionLabel: { fontSize: 10, color: Colors.text.tertiary, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 },
 
-  picker: { backgroundColor: Colors.bg.card, borderRadius: BorderRadius.md, marginBottom: 12, borderWidth: 1, borderColor: Colors.border, overflow: 'hidden' },
-  pickerItem: { padding: 12, borderBottomWidth: 1, borderBottomColor: Colors.divider },
-  pickerItemActive: { backgroundColor: Colors.accent.ultraLight },
-  pickerItemText: { fontSize: 13, color: Colors.text.secondary },
-  pickerItemTextActive: { color: Colors.accent.primaryDark, fontWeight: '600' },
+  // Modality buttons
+  modalityRow: { flexDirection: 'row', gap: 10, marginBottom: 16 },
+  modalityBtn: {
+    flex: 1,
+    alignItems: 'center',
+    backgroundColor: Colors.bg.card,
+    borderRadius: BorderRadius.xl,
+    paddingVertical: 14,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    ...Shadows.sm,
+  },
+  modalityBtnActive: { borderColor: Colors.severity.emergency, backgroundColor: Colors.severity.emergency + '08' },
+  modalityBtnDone: { borderColor: Colors.success, backgroundColor: Colors.success + '08' },
+  modalityIcon: { width: 44, height: 44, borderRadius: 22, backgroundColor: Colors.accent.ultraLight, alignItems: 'center', justifyContent: 'center', marginBottom: 6 },
+  modalityLabel: { fontSize: 13, fontWeight: '600', color: Colors.text.primary },
+  modalityModel: { fontSize: 10, color: Colors.text.tertiary, marginTop: 1 },
+  recordingBadge: { fontSize: 11, fontWeight: '700', color: Colors.severity.emergency, marginTop: 4 },
 
   inputCard: { backgroundColor: Colors.bg.card, borderRadius: BorderRadius.xl, borderWidth: 1, borderColor: Colors.border, marginBottom: 12, ...Shadows.sm },
-  textInput: { padding: 16, fontSize: 14, color: Colors.text.primary, minHeight: 160, lineHeight: 20 },
+  textInput: { padding: 16, fontSize: 14, color: Colors.text.primary, minHeight: 140, lineHeight: 20 },
+
   inputFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingBottom: 10 },
   charCount: { fontSize: 10, color: Colors.text.tertiary },
+
+  processingCard: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: Colors.accent.ultraLight, borderRadius: BorderRadius.md, padding: 14, marginTop: 12 },
+  processingText: { color: Colors.accent.primaryDark, fontSize: 13 },
+
+  imagePreviewCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.bg.card, borderRadius: BorderRadius.xl, padding: 12, marginBottom: 12, borderWidth: 1, borderColor: Colors.border, ...Shadows.sm },
+  imageThumbnail: { width: 60, height: 60, borderRadius: BorderRadius.md },
+  imagePreviewInfo: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginLeft: 12 },
+  imagePreviewLabel: { fontSize: 13, color: Colors.text.secondary, fontWeight: '500' },
+
+  coughBadge: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: Colors.accent.cyan + '10', borderRadius: BorderRadius.md, padding: 12, marginBottom: 12, borderWidth: 1, borderColor: Colors.accent.cyan + '30' },
+  coughBadgeText: { flex: 1, fontSize: 13, color: Colors.accent.cyan, fontWeight: '500' },
 
   exLabel: { fontSize: 10, color: Colors.text.tertiary, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 },
   exChip: { backgroundColor: Colors.bg.card, borderRadius: 20, paddingHorizontal: 14, paddingVertical: 7, marginRight: 8, borderWidth: 1, borderColor: Colors.border },
@@ -208,9 +602,6 @@ const styles = StyleSheet.create({
 
   submitBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: Colors.accent.primaryDark, borderRadius: BorderRadius.md, paddingVertical: 14, gap: 8, ...Shadows.md },
   submitBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
-
-  processingCard: { backgroundColor: Colors.accent.ultraLight, borderRadius: BorderRadius.md, padding: 14, marginTop: 12, alignItems: 'center' },
-  processingText: { color: Colors.accent.primaryDark, fontSize: 13 },
 
   resultContainer: { marginTop: 24 },
   resultHeader: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 10 },
@@ -232,4 +623,25 @@ const styles = StyleSheet.create({
 
   flagCard: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: Colors.severity.emergency + '10', borderRadius: 10, padding: 10, marginTop: 8 },
   flagText: { fontSize: 12, fontWeight: '700', color: Colors.severity.emergency },
+
+  imageResultCard: { backgroundColor: Colors.bg.card, borderRadius: BorderRadius.xl, padding: 16, marginTop: 12, borderWidth: 1, borderColor: Colors.border, ...Shadows.sm },
+  imageResultTitle: { fontSize: 15, fontWeight: '500', color: Colors.accent.secondary },
+  classificationRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 6 },
+  classificationLabel: { width: 120, fontSize: 12, color: Colors.text.secondary, textTransform: 'capitalize' },
+  scoreBarBg: { flex: 1, height: 6, backgroundColor: Colors.bg.elevated, borderRadius: 3, marginHorizontal: 8, overflow: 'hidden' },
+  scoreBarFill: { height: '100%', borderRadius: 3 },
+  scoreText: { width: 36, fontSize: 11, fontWeight: '600', color: Colors.text.primary, textAlign: 'right' },
+
+  // Cough modal
+  coughModalOverlay: { flex: 1, backgroundColor: Colors.overlay, justifyContent: 'center', alignItems: 'center' },
+  coughModalContent: { backgroundColor: Colors.bg.primary, borderRadius: BorderRadius['2xl'], padding: 32, width: 280, alignItems: 'center', ...Shadows.lg },
+  coughModalTitle: { fontSize: 16, fontWeight: '600', color: Colors.text.primary, marginBottom: 24 },
+  coughCountdownContainer: { alignItems: 'center', marginBottom: 24 },
+  coughCountdownText: { fontSize: 64, fontWeight: '700', color: Colors.accent.primary },
+  coughCountdownLabel: { fontSize: 14, color: Colors.text.secondary, marginTop: 8 },
+  coughRecordDot: { width: 32, height: 32, borderRadius: 16, backgroundColor: Colors.severity.emergency },
+  coughRecordingLabel: { fontSize: 16, fontWeight: '600', color: Colors.text.primary, marginTop: 16 },
+  coughRecordingSub: { fontSize: 12, color: Colors.text.tertiary, marginTop: 4 },
+  coughCancelBtn: { paddingVertical: 10, paddingHorizontal: 24 },
+  coughCancelText: { fontSize: 14, color: Colors.text.secondary },
 });

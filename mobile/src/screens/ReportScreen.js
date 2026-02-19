@@ -1,42 +1,105 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
-  View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator,
+  View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, Image, Share,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Colors, Typography, Spacing, BorderRadius, Shadows } from '../utils/theme';
+import { Colors, Typography, Spacing, BorderRadius, Shadows, SyndromeLabels } from '../utils/theme';
 import api from '../services/api';
+import { supabase } from '../services/supabase';
+import GeoPickerCascade from '../components/GeoPickerCascade';
+import ForecastChart, { computeForecast } from '../components/ForecastChart';
+import SpectrogramView from '../components/SpectrogramView';
 
-const DISTRICTS = ['Kintampo North', 'Tamale Metro', 'Wa Municipal', 'Bolgatanga'];
+const SCOPE_LEVELS = ['district', 'region', 'country', 'continental'];
+const REPORT_TYPES = [
+  { key: 'situation', icon: 'document-text-outline', label: 'Situation' },
+  { key: 'fhir', icon: 'code-slash-outline', label: 'FHIR' },
+  { key: 'weekly', icon: 'calendar-outline', label: 'Weekly' },
+];
 
 export default function ReportScreen() {
   const insets = useSafeAreaInsets();
-  const [district, setDistrict] = useState(DISTRICTS[0]);
+  const [geoSelection, setGeoSelection] = useState({});
+  const [scopeLevel, setScopeLevel] = useState('district');
   const [reportType, setReportType] = useState('situation');
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
 
+  // Forecast data
+  const [weeklyData, setWeeklyData] = useState([]);
+  const [forecastSyndrome, setForecastSyndrome] = useState('acute_watery_diarrhea');
+  const [availableSyndromes, setAvailableSyndromes] = useState([]);
+
+  // Fetch weekly counts for forecast chart
+  const fetchWeeklyData = useCallback(async () => {
+    if (!geoSelection.district_id) return;
+    try {
+      const { data } = await supabase
+        .from('weekly_counts')
+        .select('syndrome_category, week_start, count')
+        .eq('district_id', geoSelection.district_id)
+        .order('week_start', { ascending: true });
+
+      if (data && data.length > 0) {
+        const syndromes = [...new Set(data.map(d => d.syndrome_category))];
+        setAvailableSyndromes(syndromes);
+
+        const filtered = data.filter(d => d.syndrome_category === forecastSyndrome);
+        setWeeklyData(filtered.map(d => d.count));
+      }
+    } catch {
+      // Use demo data
+      setAvailableSyndromes(['acute_watery_diarrhea', 'acute_respiratory_infection', 'acute_febrile_illness']);
+      setWeeklyData([4, 5, 3, 6, 8, 7, 12, 15, 18, 22, 25, 28]);
+    }
+  }, [geoSelection.district_id, forecastSyndrome]);
+
+  useEffect(() => { fetchWeeklyData(); }, [fetchWeeklyData]);
+
   const generate = async () => {
     setLoading(true); setReport(null);
+    const districtName = geoSelection.district_name || geoSelection.region_name || geoSelection.country_name || 'ECOWAS';
     try {
       const data = reportType === 'fhir'
-        ? await api.getFHIRReport(district)
-        : await api.generateReport(district);
+        ? await api.getFHIRReport(districtName)
+        : await api.generateReport(districtName);
       setReport(data);
+
+      // Save to Supabase
+      try {
+        await supabase.from('reports').insert({
+          report_type: reportType === 'situation' ? 'situation_report' : reportType === 'fhir' ? 'fhir_bundle' : 'weekly_summary',
+          scope_type: scopeLevel,
+          scope_id: geoSelection.district_id || geoSelection.region_id || null,
+          content: typeof data === 'string' ? data : JSON.stringify(data),
+          fhir_bundle: reportType === 'fhir' ? data : null,
+        });
+      } catch { /* non-blocking */ }
     } catch {
       setReport(reportType === 'fhir' ? DEMO_FHIR : DEMO_REPORT);
     } finally { setLoading(false); }
+  };
+
+  const handleShare = async () => {
+    try {
+      const content = report?.report || JSON.stringify(report, null, 2);
+      await Share.share({
+        message: `EpiCast ${reportType.toUpperCase()} Report\n\n${content?.substring(0, 500)}...`,
+        title: 'EpiCast Report',
+      });
+    } catch { /* ignore */ }
   };
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
         <Text style={styles.title}>Reports</Text>
-        <Text style={styles.subtitle}>Generate epidemiological reports powered by MedGemma 27B</Text>
+        <Text style={styles.subtitle}>Generate epidemiological reports and disease forecasts</Text>
 
-        {/* Type Toggle */}
+        {/* Report Type Toggle */}
         <View style={styles.toggleRow}>
-          {[['situation', 'document-text-outline', 'Situation Report'], ['fhir', 'code-slash-outline', 'FHIR Report']].map(([key, icon, label]) => (
+          {REPORT_TYPES.map(({ key, icon, label }) => (
             <TouchableOpacity key={key}
               style={[styles.toggleBtn, reportType === key && styles.toggleBtnActive]}
               onPress={() => { setReportType(key); setReport(null); }}>
@@ -46,29 +109,56 @@ export default function ReportScreen() {
           ))}
         </View>
 
-        {/* District Chips */}
-        <Text style={styles.sectionLabel}>Select District</Text>
-        <View style={styles.chipRow}>
-          {DISTRICTS.map(d => (
-            <TouchableOpacity key={d}
-              style={[styles.districtChip, d === district && styles.districtChipActive]}
-              onPress={() => { setDistrict(d); setReport(null); }}>
-              <Text style={[styles.districtChipText, d === district && styles.districtChipTextActive]}>{d}</Text>
+        {/* Scope Level Picker */}
+        <Text style={styles.sectionLabel}>Scope Level</Text>
+        <View style={styles.scopeRow}>
+          {SCOPE_LEVELS.map(s => (
+            <TouchableOpacity key={s}
+              style={[styles.scopeChip, scopeLevel === s && styles.scopeChipActive]}
+              onPress={() => setScopeLevel(s)}>
+              <Ionicons
+                name={s === 'continental' ? 'globe' : s === 'country' ? 'flag' : s === 'region' ? 'map' : 'location'}
+                size={12}
+                color={scopeLevel === s ? Colors.accent.primaryDark : Colors.text.tertiary}
+              />
+              <Text style={[styles.scopeText, scopeLevel === s && styles.scopeTextActive]}>
+                {s.charAt(0).toUpperCase() + s.slice(1)}
+              </Text>
             </TouchableOpacity>
           ))}
         </View>
 
+        {/* Geo Picker */}
+        {scopeLevel !== 'continental' && (
+          <GeoPickerCascade
+            value={geoSelection}
+            onChange={setGeoSelection}
+            maxLevel={scopeLevel}
+            label="Select Area"
+          />
+        )}
+
         {/* Generate */}
         <TouchableOpacity style={[styles.genBtn, loading && { opacity: 0.7 }]} onPress={generate} disabled={loading}>
           {loading ? <ActivityIndicator color="#fff" /> : (
-            <><Ionicons name="sparkles" size={16} color="#fff" /><Text style={styles.genBtnText}>Generate {reportType === 'fhir' ? 'FHIR Report' : 'Situation Report'}</Text></>
+            <><Ionicons name="sparkles" size={16} color="#fff" /><Text style={styles.genBtnText}>Generate {reportType === 'fhir' ? 'FHIR Bundle' : reportType === 'weekly' ? 'Weekly Summary' : 'Situation Report'}</Text></>
           )}
         </TouchableOpacity>
 
         {loading && (
           <View style={styles.loadingCard}>
-            <Text style={styles.loadingText}>MedGemma 27B is analyzing surveillance data for {district}...</Text>
+            <Text style={styles.loadingText}>MedGemma 27B is analyzing surveillance data...</Text>
           </View>
+        )}
+
+        {/* Forecast Chart */}
+        {weeklyData.length > 0 && (
+          <ForecastChart
+            historicalData={weeklyData}
+            selectedSyndrome={forecastSyndrome}
+            onSyndromeChange={(s) => { setForecastSyndrome(s); }}
+            syndromes={availableSyndromes}
+          />
         )}
 
         {/* Situation Report */}
@@ -76,7 +166,7 @@ export default function ReportScreen() {
           <View style={styles.reportCard}>
             <View style={styles.reportHeader}>
               <Ionicons name="document-text" size={16} color={Colors.accent.primaryDark} />
-              <Text style={styles.reportTitle}>Situation Report — {district}</Text>
+              <Text style={styles.reportTitle}>Situation Report</Text>
             </View>
             <Text style={styles.reportDate}>{new Date().toLocaleDateString()}</Text>
             <View style={styles.reportBody}>
@@ -95,6 +185,14 @@ export default function ReportScreen() {
                 ))}
               </View>
             )}
+
+            {/* Export buttons */}
+            <View style={styles.exportRow}>
+              <TouchableOpacity style={styles.exportBtn} onPress={handleShare}>
+                <Ionicons name="share-outline" size={14} color={Colors.accent.primaryDark} />
+                <Text style={styles.exportBtnText}>Share</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         )}
 
@@ -103,7 +201,7 @@ export default function ReportScreen() {
           <View style={styles.reportCard}>
             <View style={styles.reportHeader}>
               <Ionicons name="code-slash" size={16} color={Colors.accent.secondary} />
-              <Text style={styles.reportTitle}>FHIR Bundle — {district}</Text>
+              <Text style={styles.reportTitle}>FHIR Bundle</Text>
             </View>
             <View style={styles.fhirBlock}>
               <Text style={styles.fhirText}>
@@ -111,10 +209,32 @@ export default function ReportScreen() {
                 {JSON.stringify(report).length > 1500 ? '\n...(truncated)' : ''}
               </Text>
             </View>
-            <TouchableOpacity style={styles.exportBtn}>
-              <Ionicons name="share-outline" size={14} color={Colors.accent.primaryDark} />
-              <Text style={styles.exportBtnText}>Export FHIR Bundle</Text>
-            </TouchableOpacity>
+            <View style={styles.exportRow}>
+              <TouchableOpacity style={styles.exportBtn} onPress={handleShare}>
+                <Ionicons name="share-outline" size={14} color={Colors.accent.primaryDark} />
+                <Text style={styles.exportBtnText}>Export FHIR</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
+        {/* Weekly Report */}
+        {report && reportType === 'weekly' && (
+          <View style={styles.reportCard}>
+            <View style={styles.reportHeader}>
+              <Ionicons name="calendar" size={16} color={Colors.accent.primaryDark} />
+              <Text style={styles.reportTitle}>Weekly Summary</Text>
+            </View>
+            <Text style={styles.reportDate}>{new Date().toLocaleDateString()}</Text>
+            <View style={styles.reportBody}>
+              <Text style={styles.reportText}>{report.report || JSON.stringify(report, null, 2)}</Text>
+            </View>
+            <View style={styles.exportRow}>
+              <TouchableOpacity style={styles.exportBtn} onPress={handleShare}>
+                <Ionicons name="share-outline" size={14} color={Colors.accent.primaryDark} />
+                <Text style={styles.exportBtnText}>Share</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         )}
       </ScrollView>
@@ -124,13 +244,13 @@ export default function ReportScreen() {
 
 const DEMO_REPORT = {
   report_time: new Date().toISOString(),
-  report: `EPIDEMIOLOGICAL SITUATION REPORT — KINTAMPO NORTH DISTRICT
+  report: `EPIDEMIOLOGICAL SITUATION REPORT
 
 SITUATION SUMMARY
-A significant outbreak of acute watery diarrhea has been detected in Kintampo North district. Over the past week, 25 cases have been reported, representing a 4.8-fold increase above the 8-week baseline of 5.2 cases per week. The trend has been increasing over the past 3 consecutive weeks.
+A significant outbreak of acute watery diarrhea has been detected. Over the past week, 25 cases have been reported, representing a 4.8-fold increase above the 8-week baseline of 5.2 cases per week. The trend has been increasing over the past 3 consecutive weeks.
 
 KEY FINDINGS
-The cases are concentrated in communities relying on the Kintampo community well, which was contaminated following recent flooding events. Clinical presentations are consistent with cholera: rice-water stool, severe dehydration, rapid onset. 3 cases classified as critical severity requiring IV rehydration. Cluster indicator positive with multiple household contacts reporting symptoms.
+Cases are concentrated in communities relying on community well water, which was contaminated following recent flooding events. Clinical presentations are consistent with cholera: rice-water stool, severe dehydration, rapid onset.
 
 RISK ASSESSMENT: HIGH
 The combination of rapidly increasing case counts, evidence of a common-source exposure, and clinical features consistent with cholera indicates a high probability of an ongoing outbreak.
@@ -138,13 +258,11 @@ The combination of rapidly increasing case counts, evidence of a common-source e
 RECOMMENDED ACTIONS
 1. Deploy rapid diagnostic testing for Vibrio cholerae
 2. Establish oral rehydration therapy stations at community health posts
-3. Conduct environmental investigation of the Kintampo community well
+3. Conduct environmental investigation of water sources
 4. Implement enhanced case-based surveillance with daily reporting
-5. Alert neighboring districts for cross-border surveillance
-6. Pre-position cholera treatment kits at sub-district hospitals`,
+5. Alert neighboring districts for cross-border surveillance`,
   alerts: [
     { alert_level: 'emergency', syndrome_category: 'acute_watery_diarrhea', case_count_current_week: 25, ratio_to_baseline: 4.81 },
-    { alert_level: 'warning', syndrome_category: 'acute_hemorrhagic_fever', case_count_current_week: 3, ratio_to_baseline: 6.0 },
   ],
 };
 
@@ -152,9 +270,9 @@ const DEMO_FHIR = {
   resourceType: 'Bundle', id: 'epicast-fhir-001', type: 'collection',
   timestamp: new Date().toISOString(),
   entry: [
-    { resource: { resourceType: 'Composition', status: 'final', title: 'Surveillance Report — Kintampo North' } },
+    { resource: { resourceType: 'Composition', status: 'final', title: 'Surveillance Report' } },
     { resource: { resourceType: 'Observation', code: { coding: [{ code: 'acute_watery_diarrhea', display: 'Acute Watery Diarrhea' }] }, valueQuantity: { value: 25, unit: 'cases' } } },
-    { resource: { resourceType: 'DetectedIssue', code: { coding: [{ code: 'emergency', display: 'EMERGENCY — acute_watery_diarrhea' }] } } },
+    { resource: { resourceType: 'DetectedIssue', code: { coding: [{ code: 'emergency', display: 'EMERGENCY' }] } } },
   ],
 };
 
@@ -165,18 +283,19 @@ const styles = StyleSheet.create({
   title: { fontSize: Typography.size.lg, fontWeight: '500', color: Colors.text.primary, marginTop: 16, letterSpacing: -0.3 },
   subtitle: { fontSize: 13, color: Colors.text.secondary, marginTop: 4, marginBottom: 20 },
 
+  sectionLabel: { fontSize: 10, color: Colors.text.tertiary, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 },
+
   toggleRow: { flexDirection: 'row', gap: 8, marginBottom: 20 },
   toggleBtn: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 10, backgroundColor: Colors.bg.card, borderRadius: BorderRadius.md, borderWidth: 1, borderColor: Colors.border },
   toggleBtnActive: { borderColor: Colors.accent.primary, backgroundColor: Colors.accent.ultraLight },
   toggleText: { fontSize: 13, color: Colors.text.tertiary },
   toggleTextActive: { color: Colors.accent.primaryDark, fontWeight: '600' },
 
-  sectionLabel: { fontSize: 10, color: Colors.text.tertiary, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 },
-  chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 20 },
-  districtChip: { paddingHorizontal: 14, paddingVertical: 7, backgroundColor: Colors.bg.card, borderRadius: 20, borderWidth: 1, borderColor: Colors.border },
-  districtChipActive: { borderColor: Colors.accent.primary, backgroundColor: Colors.accent.ultraLight },
-  districtChipText: { fontSize: 12, color: Colors.text.secondary },
-  districtChipTextActive: { color: Colors.accent.primaryDark, fontWeight: '600' },
+  scopeRow: { flexDirection: 'row', gap: 8, marginBottom: 16 },
+  scopeChip: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4, paddingVertical: 8, backgroundColor: Colors.bg.card, borderRadius: 20, borderWidth: 1, borderColor: Colors.border },
+  scopeChipActive: { borderColor: Colors.accent.primary, backgroundColor: Colors.accent.ultraLight },
+  scopeText: { fontSize: 11, color: Colors.text.tertiary },
+  scopeTextActive: { color: Colors.accent.primaryDark, fontWeight: '600' },
 
   genBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: Colors.accent.primaryDark, borderRadius: BorderRadius.md, paddingVertical: 14, ...Shadows.md },
   genBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
@@ -199,6 +318,8 @@ const styles = StyleSheet.create({
 
   fhirBlock: { backgroundColor: Colors.bg.secondary, borderRadius: BorderRadius.md, padding: 12 },
   fhirText: { fontSize: 10, fontFamily: 'monospace', color: Colors.accent.secondary, lineHeight: 15 },
-  exportBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 12, paddingVertical: 10, borderWidth: 1, borderColor: Colors.accent.primary, borderRadius: BorderRadius.md },
+
+  exportRow: { flexDirection: 'row', gap: 10, marginTop: 14, justifyContent: 'center' },
+  exportBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 10, paddingHorizontal: 20, borderWidth: 1, borderColor: Colors.accent.primary, borderRadius: BorderRadius.md },
   exportBtnText: { fontSize: 13, color: Colors.accent.primaryDark, fontWeight: '500' },
 });

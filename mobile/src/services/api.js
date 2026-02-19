@@ -3,9 +3,7 @@
  * Connects React Native app to FastAPI backend on H100.
  */
 
-const API_BASE_URL = __DEV__
-  ? 'http://192.168.1.100:8000'
-  : 'https://epicast-api.your-domain.com';
+const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || 'http://localhost:8000';
 
 class EpiCastAPI {
   constructor(baseUrl = API_BASE_URL) {
@@ -13,18 +11,23 @@ class EpiCastAPI {
   }
 
   async _fetch(endpoint, options = {}) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
     try {
       const response = await fetch(`${this.baseUrl}${endpoint}`, {
         headers: { 'Content-Type': 'application/json', ...options.headers },
+        signal: controller.signal,
         ...options,
       });
+      clearTimeout(timeoutId);
       if (!response.ok) {
         const error = await response.json().catch(() => ({}));
         throw new Error(error.detail || `API error: ${response.status}`);
       }
       return await response.json();
     } catch (error) {
-      if (error.message.includes('Network request failed')) {
+      clearTimeout(timeoutId);
+      if (error.name === 'AbortError' || error.message.includes('Network request failed')) {
         throw new Error('Cannot reach EpiCast server.');
       }
       throw error;
@@ -63,6 +66,29 @@ class EpiCastAPI {
   }
 
   async getDashboard() { return this._fetch('/dashboard'); }
+
+  async transcribeAudio(audioBase64, format = 'wav') {
+    return this._fetch('/transcribe', {
+      method: 'POST',
+      body: JSON.stringify({ audio_base64: audioBase64, format }),
+    });
+  }
+
+  async classifyImage(imageBase64, clinicalContext = null) {
+    return this._fetch('/image-triage', {
+      method: 'POST',
+      body: JSON.stringify({ image_base64: imageBase64, clinical_context: clinicalContext }),
+    });
+  }
+
+  async getHearSpectrogram() { return this._fetch('/hear/spectrogram'); }
+
+  async analyzeCough(audioBase64, format = 'wav') {
+    return this._fetch('/cough/analyze', {
+      method: 'POST',
+      body: JSON.stringify({ audio_base64: audioBase64, format }),
+    });
+  }
 }
 
 export const api = new EpiCastAPI();

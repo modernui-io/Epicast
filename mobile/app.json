@@ -21,7 +21,13 @@
     "plugins": [
       "expo-location",
       "expo-image-picker",
-      "expo-audio"
+      "expo-audio",
+      [
+        "react-native-maps",
+        {
+          "googleMapsApiKey": "YOUR_GOOGLE_MAPS_API_KEY"
+        }
+      ]
     ]
   }
 }

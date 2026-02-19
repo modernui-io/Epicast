@@ -57,6 +57,22 @@ export const Colors = {
     unexplained_cluster: '#6B7280',
   },
 
+  // Chart colors (for ForecastChart)
+  chart: {
+    historical: '#10B981',
+    forecast: '#14B8A6',
+    confidenceInterval: '#06B6D4',
+    threshold: '#EF4444',
+  },
+
+  // Map marker colors
+  map: {
+    emergency: '#EF4444',
+    warning: '#F97316',
+    watch: '#F59E0B',
+    normal: '#10B981',
+  },
+
   // Utility
   border: '#E5E7EB',
   borderLight: '#F3F4F6',

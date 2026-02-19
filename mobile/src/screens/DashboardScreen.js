@@ -7,13 +7,13 @@ import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Colors, Typography, Spacing, BorderRadius, Shadows, SyndromeLabels, AlertLevelConfig } from '../utils/theme';
-import api from '../services/api';
+import { supabase } from '../services/supabase';
 
 const { width: SW } = Dimensions.get('window');
 
 function StatCard({ label, value, icon, color, subtitle }) {
   return (
-    <View style={[styles.statCard]}>
+    <View style={styles.statCard}>
       <View style={styles.statIcon}>
         <Ionicons name={icon} size={18} color={color} />
       </View>
@@ -45,13 +45,14 @@ function SyndromeBar({ syndrome, count, maxCount }) {
 function EncounterRow({ encounter }) {
   const sevColors = { mild: Colors.severity.low, moderate: Colors.severity.watch, severe: Colors.severity.warning, critical: Colors.severity.emergency };
   const color = sevColors[encounter.severity] || Colors.text.tertiary;
-  const name = SyndromeLabels[encounter.syndrome] || encounter.syndrome || 'Unknown';
+  const name = SyndromeLabels[encounter.syndrome_category] || encounter.syndrome_category || 'Unknown';
+  const timeAgo = getTimeAgo(encounter.created_at);
   return (
     <View style={styles.encounterRow}>
       <View style={[styles.encounterDot, { backgroundColor: color }]} />
       <View style={{ flex: 1 }}>
         <Text style={styles.encounterName} numberOfLines={1}>{name}</Text>
-        <Text style={styles.encounterMeta}>{encounter.district || 'Unknown'} · {encounter.time}</Text>
+        <Text style={styles.encounterMeta}>{encounter.district_name || 'Unknown'} · {timeAgo}</Text>
       </View>
       <View style={[styles.sevChip, { backgroundColor: color + '15' }]}>
         <Text style={[styles.sevChipText, { color }]}>{(encounter.severity || '').toUpperCase()}</Text>
@@ -60,21 +61,103 @@ function EncounterRow({ encounter }) {
   );
 }
 
+function getTimeAgo(dateStr) {
+  if (!dateStr) return '';
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'Just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
 export default function DashboardScreen() {
   const insets = useSafeAreaInsets();
-  const [dashboard, setDashboard] = useState(null);
-  const [alerts, setAlerts] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [serverOnline, setServerOnline] = useState(false);
+  const [dataSource, setDataSource] = useState('demo');
+
+  const [totalEncounters, setTotalEncounters] = useState(0);
+  const [totalAlerts, setTotalAlerts] = useState(0);
+  const [alertsByLevel, setAlertsByLevel] = useState({});
+  const [districtCount, setDistrictCount] = useState(0);
+  const [syndromeDist, setSyndromeDist] = useState({});
+  const [recentEncounters, setRecentEncounters] = useState([]);
 
   const fetchData = useCallback(async () => {
     try {
-      const [d, a] = await Promise.all([api.getDashboard(), api.getAlerts()]);
-      setDashboard(d); setAlerts(a); setServerOnline(true);
+      // Total encounters
+      const { count: encCount } = await supabase
+        .from('encounters')
+        .select('id', { count: 'exact', head: true });
+      setTotalEncounters(encCount || 0);
+
+      // Alerts
+      const { data: alerts } = await supabase
+        .from('alerts')
+        .select('alert_level')
+        .eq('is_active', true);
+      const byLevel = {};
+      (alerts || []).forEach(a => { byLevel[a.alert_level] = (byLevel[a.alert_level] || 0) + 1; });
+      setTotalAlerts((alerts || []).length);
+      setAlertsByLevel(byLevel);
+
+      // Districts count
+      const { count: dCount } = await supabase
+        .from('districts')
+        .select('id', { count: 'exact', head: true });
+      setDistrictCount(dCount || 0);
+
+      // Syndrome distribution from encounters
+      const { data: encounters } = await supabase
+        .from('encounters')
+        .select('syndrome_category')
+        .not('syndrome_category', 'is', null);
+      const dist = {};
+      (encounters || []).forEach(e => {
+        if (e.syndrome_category) dist[e.syndrome_category] = (dist[e.syndrome_category] || 0) + 1;
+      });
+      setSyndromeDist(dist);
+
+      // Recent encounters with district name
+      const { data: recent } = await supabase
+        .from('encounters')
+        .select('id, syndrome_category, severity, created_at, district_id')
+        .order('created_at', { ascending: false })
+        .limit(6);
+
+      // Get district names for recent encounters
+      const districtIds = [...new Set((recent || []).map(e => e.district_id).filter(Boolean))];
+      let districtMap = {};
+      if (districtIds.length > 0) {
+        const { data: districts } = await supabase
+          .from('districts')
+          .select('id, name')
+          .in('id', districtIds);
+        (districts || []).forEach(d => { districtMap[d.id] = d.name; });
+      }
+
+      setRecentEncounters((recent || []).map(e => ({
+        ...e,
+        district_name: districtMap[e.district_id] || 'Unknown',
+      })));
+
+      setDataSource('live');
     } catch {
-      setServerOnline(false); setDashboard(DEMO_DASH); setAlerts(DEMO_ALERTS);
-    } finally { setLoading(false); setRefreshing(false); }
+      // Fallback to demo data
+      setDataSource('demo');
+      setTotalEncounters(DEMO_DASH.total_encounters);
+      setTotalAlerts(DEMO_ALERTS.total_alerts);
+      setAlertsByLevel(DEMO_ALERTS.by_level);
+      setDistrictCount(DEMO_DASH.districts.length);
+      setSyndromeDist(DEMO_DASH.syndrome_distribution);
+      setRecentEncounters(DEMO_DASH.recent_encounters);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
   }, []);
 
   useEffect(() => { fetchData(); }, [fetchData]);
@@ -84,12 +167,12 @@ export default function DashboardScreen() {
     return (
       <View style={[styles.container, styles.center]}>
         <ActivityIndicator size="large" color={Colors.accent.primary} />
-        <Text style={{ color: Colors.text.secondary, marginTop: 12, fontSize: 14 }}>Connecting to EpiCast...</Text>
+        <Text style={{ color: Colors.text.secondary, marginTop: 12, fontSize: 14 }}>Loading EpiCast...</Text>
       </View>
     );
   }
 
-  const synEntries = Object.entries(dashboard?.syndrome_distribution || {}).sort((a, b) => b[1] - a[1]);
+  const synEntries = Object.entries(syndromeDist).sort((a, b) => b[1] - a[1]);
   const maxSyn = synEntries.length > 0 ? synEntries[0][1] : 1;
 
   return (
@@ -108,38 +191,37 @@ export default function DashboardScreen() {
           <View style={styles.headerTop}>
             <Text style={styles.appName}>epicast</Text>
             <View style={styles.statusPill}>
-              <View style={[styles.statusDot, { backgroundColor: serverOnline ? '#10B981' : '#F59E0B' }]} />
-              <Text style={styles.statusText}>{serverOnline ? 'LIVE' : 'DEMO'}</Text>
+              <View style={[styles.statusDot, { backgroundColor: dataSource === 'live' ? '#10B981' : '#F59E0B' }]} />
+              <Text style={styles.statusText}>{dataSource === 'live' ? 'LIVE' : 'DEMO'}</Text>
             </View>
           </View>
 
-          <View style={styles.quickActions}>
-            <Text style={styles.quickLabel}>Quick access</Text>
-            <View style={styles.quickRow}>
-              <View style={styles.quickPill}><Ionicons name="add" size={14} color="rgba(255,255,255,0.9)" /><Text style={styles.quickPillText}>New Encounter</Text></View>
-              <View style={styles.quickPill}><Text style={styles.quickPillText}>Run Scan</Text></View>
-              <View style={styles.quickPill}><Text style={styles.quickPillText}>Alerts</Text></View>
-            </View>
-          </View>
+          <Text style={styles.headerSubtitle}>ECOWAS Disease Surveillance Platform</Text>
 
-          {/* Floating rewards-style card */}
-          <View style={styles.floatingCard}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.floatingHint}>Your surveillance <Text style={{ fontWeight: '500' }}>activity score</Text> this month</Text>
-              <Text style={styles.floatingValue}>{dashboard?.total_encounters || 0}<Text style={styles.floatingUnit}> encounters</Text></Text>
+          {/* Stats summary card */}
+          <View style={styles.summaryCard}>
+            <View style={styles.summaryItem}>
+              <Text style={styles.summaryValue}>{totalEncounters}</Text>
+              <Text style={styles.summaryLabel}>Encounters</Text>
             </View>
-            <Text style={styles.floatingScore}>{alerts?.total_alerts || 0}</Text>
+            <View style={styles.summaryDivider} />
+            <View style={styles.summaryItem}>
+              <Text style={styles.summaryValue}>{totalAlerts}</Text>
+              <Text style={styles.summaryLabel}>Active Alerts</Text>
+            </View>
+            <View style={styles.summaryDivider} />
+            <View style={styles.summaryItem}>
+              <Text style={styles.summaryValue}>{districtCount}</Text>
+              <Text style={styles.summaryLabel}>Districts</Text>
+            </View>
           </View>
         </LinearGradient>
 
-        {/* Spacer for floating card overlap */}
-        <View style={{ height: 40 }} />
-
         {/* Alert Badges */}
-        {alerts && alerts.total_alerts > 0 && (
+        {totalAlerts > 0 && (
           <View style={styles.alertRow}>
             {['emergency', 'warning', 'watch'].map(lvl => {
-              const count = alerts.by_level?.[lvl] || 0;
+              const count = alertsByLevel[lvl] || 0;
               if (count === 0) return null;
               const cfg = AlertLevelConfig[lvl];
               return (
@@ -154,10 +236,10 @@ export default function DashboardScreen() {
 
         {/* Stats Grid */}
         <View style={styles.statsGrid}>
-          <StatCard label="Encounters" value={dashboard?.total_encounters || 0} icon="people" color={Colors.accent.primary} subtitle="Total processed" />
-          <StatCard label="Active Alerts" value={alerts?.total_alerts || 0} icon="alert-circle" color={alerts?.by_level?.emergency > 0 ? Colors.severity.emergency : Colors.severity.watch} subtitle="Monitoring" />
-          <StatCard label="Districts" value={dashboard?.districts?.length || 0} icon="location" color={Colors.accent.secondary} subtitle="Under surveillance" />
-          <StatCard label="Syndromes" value={Object.keys(dashboard?.syndrome_distribution || {}).length} icon="analytics" color="#8B5CF6" subtitle="Tracked" />
+          <StatCard label="Encounters" value={totalEncounters} icon="people" color={Colors.accent.primary} subtitle="Total processed" />
+          <StatCard label="Active Alerts" value={totalAlerts} icon="alert-circle" color={alertsByLevel.emergency > 0 ? Colors.severity.emergency : Colors.severity.watch} subtitle="Monitoring" />
+          <StatCard label="Districts" value={districtCount} icon="location" color={Colors.accent.secondary} subtitle="Under surveillance" />
+          <StatCard label="Syndromes" value={Object.keys(syndromeDist).length} icon="analytics" color="#8B5CF6" subtitle="Tracked" />
         </View>
 
         {/* Syndrome Distribution */}
@@ -173,8 +255,8 @@ export default function DashboardScreen() {
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Recent Encounters</Text>
           <View style={styles.card}>
-            {(dashboard?.recent_encounters || []).slice(0, 6).map((e, i) => <EncounterRow key={e.id || i} encounter={e} />)}
-            {(!dashboard?.recent_encounters?.length) && <Text style={styles.emptyText}>No encounters yet. Tap "Intake" to begin.</Text>}
+            {recentEncounters.slice(0, 6).map((e, i) => <EncounterRow key={e.id || i} encounter={e} />)}
+            {recentEncounters.length === 0 && <Text style={styles.emptyText}>No encounters yet. Tap + to begin.</Text>}
           </View>
         </View>
 
@@ -198,12 +280,12 @@ const DEMO_DASH = {
   },
   districts: ['Kintampo North', 'Tamale Metro', 'Wa Municipal', 'Bolgatanga', 'Kassena Nankana'],
   recent_encounters: [
-    { id: 'e1', time: '2 min ago', district: 'Kintampo North', syndrome: 'acute_watery_diarrhea', severity: 'severe' },
-    { id: 'e2', time: '10 min ago', district: 'Kintampo North', syndrome: 'acute_watery_diarrhea', severity: 'moderate' },
-    { id: 'e3', time: '20 min ago', district: 'Tamale Metro', syndrome: 'acute_febrile_illness', severity: 'moderate' },
-    { id: 'e4', time: '30 min ago', district: 'Kintampo North', syndrome: 'acute_watery_diarrhea', severity: 'critical' },
-    { id: 'e5', time: '1h ago', district: 'Wa Municipal', syndrome: 'acute_respiratory_infection', severity: 'mild' },
-    { id: 'e6', time: '1.5h ago', district: 'Bolgatanga', syndrome: 'acute_hemorrhagic_fever', severity: 'severe' },
+    { id: 'e1', created_at: new Date(Date.now() - 2 * 60000).toISOString(), district_name: 'Kano Municipal', syndrome_category: 'acute_watery_diarrhea', severity: 'severe' },
+    { id: 'e2', created_at: new Date(Date.now() - 10 * 60000).toISOString(), district_name: 'Kano Municipal', syndrome_category: 'acute_watery_diarrhea', severity: 'moderate' },
+    { id: 'e3', created_at: new Date(Date.now() - 20 * 60000).toISOString(), district_name: 'Accra Metropolis', syndrome_category: 'acute_febrile_illness', severity: 'moderate' },
+    { id: 'e4', created_at: new Date(Date.now() - 30 * 60000).toISOString(), district_name: 'Nzerekore City', syndrome_category: 'acute_hemorrhagic_fever', severity: 'critical' },
+    { id: 'e5', created_at: new Date(Date.now() - 60 * 60000).toISOString(), district_name: 'Dakar Plateau', syndrome_category: 'acute_respiratory_infection', severity: 'mild' },
+    { id: 'e6', created_at: new Date(Date.now() - 90 * 60000).toISOString(), district_name: 'Ouagadougou', syndrome_category: 'acute_neurological_syndrome', severity: 'severe' },
   ],
 };
 const DEMO_ALERTS = { total_alerts: 4, by_level: { emergency: 1, warning: 2, watch: 1 } };
@@ -213,38 +295,34 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: Colors.bg.secondary },
   center: { justifyContent: 'center', alignItems: 'center' },
 
-  // Header
-  header: { paddingHorizontal: Spacing.xl, paddingBottom: 80, zIndex: 1 },
+  header: { paddingHorizontal: Spacing.xl, paddingBottom: 24, borderBottomLeftRadius: BorderRadius.xl, borderBottomRightRadius: BorderRadius.xl },
   headerTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   appName: { fontSize: Typography.size['2xl'], fontWeight: Typography.weight.medium, color: '#fff', letterSpacing: -0.5 },
   statusPill: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.95)', paddingHorizontal: 12, paddingVertical: 5, borderRadius: 20 },
   statusDot: { width: 6, height: 6, borderRadius: 3, marginRight: 5 },
   statusText: { fontSize: 10, fontWeight: '600', color: Colors.text.secondary, letterSpacing: 0.5 },
+  headerSubtitle: { fontSize: 13, color: 'rgba(255,255,255,0.8)', marginTop: 4 },
 
-  quickActions: { marginTop: 24 },
-  quickLabel: { fontSize: 13, color: 'rgba(255,255,255,0.75)', fontWeight: '500', marginBottom: 10 },
-  quickRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  quickPill: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.15)', borderRadius: 20, paddingHorizontal: 14, paddingVertical: 8, gap: 4 },
-  quickPillText: { fontSize: 13, color: 'rgba(255,255,255,0.9)', fontWeight: '500' },
-
-  floatingCard: {
-    position: 'absolute', bottom: -36, left: Spacing.xl, right: Spacing.xl,
-    backgroundColor: 'rgba(255,255,255,0.18)', borderRadius: BorderRadius.xl,
-    padding: 20, flexDirection: 'row', alignItems: 'flex-start',
-    borderWidth: 1, borderColor: 'rgba(255,255,255,0.25)',
+  summaryCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    borderRadius: BorderRadius.lg,
+    paddingVertical: 16,
+    marginTop: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
   },
-  floatingHint: { fontSize: 11, color: 'rgba(255,255,255,0.7)', marginBottom: 4 },
-  floatingValue: { fontSize: 32, fontWeight: '500', color: 'rgba(255,255,255,0.95)', letterSpacing: -1 },
-  floatingUnit: { fontSize: 14, fontWeight: '400', color: 'rgba(255,255,255,0.65)' },
-  floatingScore: { fontSize: 36, fontWeight: '600', color: 'rgba(255,255,255,0.9)' },
+  summaryItem: { flex: 1, alignItems: 'center' },
+  summaryValue: { fontSize: 24, fontWeight: '700', color: '#fff' },
+  summaryLabel: { fontSize: 10, color: 'rgba(255,255,255,0.75)', marginTop: 2 },
+  summaryDivider: { width: 1, height: 32, backgroundColor: 'rgba(255,255,255,0.25)' },
 
-  // Alert badges
-  alertRow: { flexDirection: 'row', paddingHorizontal: Spacing.xl, gap: 8, marginBottom: 16 },
+  alertRow: { flexDirection: 'row', paddingHorizontal: Spacing.xl, gap: 8, marginTop: 16, marginBottom: 16 },
   alertBadge: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 20 },
   alertBadgeDot: { width: 6, height: 6, borderRadius: 3, marginRight: 5 },
   alertBadgeText: { fontSize: 11, fontWeight: '600' },
 
-  // Stats
   statsGrid: { flexDirection: 'row', flexWrap: 'wrap', paddingHorizontal: Spacing.xl, gap: 10, marginBottom: 24 },
   statCard: {
     width: (SW - Spacing.xl * 2 - 10) / 2,
@@ -256,12 +334,10 @@ const styles = StyleSheet.create({
   statLabel: { fontSize: 11, color: Colors.text.secondary, fontWeight: '500', marginTop: 2 },
   statSubtitle: { fontSize: 10, color: Colors.text.tertiary, marginTop: 1 },
 
-  // Sections
   section: { paddingHorizontal: Spacing.xl, marginBottom: 24 },
   sectionTitle: { fontSize: 12, color: Colors.text.tertiary, fontWeight: '500', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10 },
   card: { backgroundColor: Colors.bg.card, borderRadius: BorderRadius.xl, padding: 16, borderWidth: 1, borderColor: Colors.border, ...Shadows.sm },
 
-  // Syndrome bars
   syndromeRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
   syndromeInfo: { flexDirection: 'row', alignItems: 'center', width: 130 },
   syndromeDot: { width: 7, height: 7, borderRadius: 4, marginRight: 6 },
@@ -270,7 +346,6 @@ const styles = StyleSheet.create({
   syndromeBarFill: { height: '100%', borderRadius: 3 },
   syndromeCount: { fontSize: 12, fontWeight: '600', width: 26, textAlign: 'right' },
 
-  // Encounters
   encounterRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: Colors.divider },
   encounterDot: { width: 8, height: 8, borderRadius: 4, marginRight: 10 },
   encounterName: { fontSize: 13, fontWeight: '500', color: Colors.text.primary },
