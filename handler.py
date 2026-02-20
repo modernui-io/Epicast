@@ -458,7 +458,7 @@ def handle_image_triage(input_data):
 
         # Use the ImageTriageAgent if available
         if image_agent and hasattr(image_agent, "classify_image"):
-            result = image_agent.classify_image(image, clinical_context)
+            result = image_agent.classify_image(image)
             return result
 
         # Otherwise, direct MedGemma vision inference
