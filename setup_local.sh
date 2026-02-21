@@ -11,7 +11,10 @@ echo "=================================="
 # 1. Python deps
 echo ""
 echo "[1/4] Installing Python dependencies..."
-pip install flask flask-cors onnxruntime numpy librosa joblib soundfile huggingface_hub
+# Install llvmlite first with --prefer-binary to avoid needing LLVM compiler
+# (llvmlite is pulled in by numba, which librosa optionally uses)
+pip install --prefer-binary llvmlite
+pip install --prefer-binary flask flask-cors onnxruntime numpy librosa joblib soundfile huggingface_hub
 
 # 2. llama.cpp
 echo ""
