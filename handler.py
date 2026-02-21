@@ -100,20 +100,11 @@ def load_models():
     # ── 3. HeAR model + sklearn classifier (cough analysis) ──────────────
     print("[3/4] Loading HeAR cough analysis pipeline...")
     try:
-        from transformers import AutoModel
-        import importlib
-        import sys
+        from transformers import AutoModel, AutoFeatureExtractor
 
-        # Clone HeAR repo for audio preprocessing utilities
-        hear_repo_path = "/app/hear"
-        if not os.path.exists(hear_repo_path):
-            os.system("git clone -q https://github.com/Google-Health/hear.git /app/hear")
-        if hear_repo_path not in sys.path:
-            sys.path.insert(0, hear_repo_path)
-
-        # Load HeAR audio preprocessing
-        audio_utils = importlib.import_module("hear.python.data_processing.audio_utils")
-        _models["hear_audio_utils"] = audio_utils
+        # Use HuggingFace feature extractor — no git clone needed
+        hear_feature_extractor = AutoFeatureExtractor.from_pretrained("google/hear-pytorch")
+        _models["hear_feature_extractor"] = hear_feature_extractor
 
         # Load HeAR embedding model
         hear_model = AutoModel.from_pretrained("google/hear-pytorch")
@@ -137,7 +128,7 @@ def load_models():
         print("    → Cough analysis will use energy-based fallback")
         _models["hear_model"] = None
         _models["hear_classifier"] = None
-        _models["hear_audio_utils"] = None
+        _models["hear_feature_extractor"] = None
 
     # ── 4. Initialize agents ─────────────────────────────────────────────
     print("[4/4] Initializing EpiCast agents...")
@@ -293,29 +284,23 @@ def handle_cough(input_data):
 
         hear_model = _models.get("hear_model")
         hear_classifier = _models.get("hear_classifier")
-        audio_utils = _models.get("hear_audio_utils")
+        hear_feature_extractor = _models.get("hear_feature_extractor")
+
+        def _hear_embed(audio_array, sr):
+            """Run audio through HeAR feature extractor + model → numpy embedding."""
+            device = next(hear_model.parameters()).device
+            inputs = hear_feature_extractor(
+                audio_array.tolist(), sampling_rate=sr, return_tensors="pt", padding=True
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                output = hear_model(**inputs, return_dict=True)
+                embedding = output.last_hidden_state.mean(dim=1)
+            return embedding.cpu().numpy()
 
         # ── Path A: Full HeAR pipeline ────────────────────────────────
-        if hear_model is not None and hear_classifier is not None and audio_utils is not None:
-            device = next(hear_model.parameters()).device
-
-            # HeAR expects 2-second clips; pad or trim
-            target_length = 2 * sr  # 32000 samples
-            if len(audio) < target_length:
-                audio = np.pad(audio, (0, target_length - len(audio)))
-            else:
-                audio = audio[:target_length]
-
-            # Convert to HeAR spectrogram input
-            audio_tensor = torch.tensor(audio, dtype=torch.float32)
-            spectrogram = audio_utils.audio_to_spec(audio_tensor)
-            spectrogram = spectrogram.unsqueeze(0).to(device)  # batch dim
-
-            # Get HeAR embedding (512-dim)
-            with torch.no_grad():
-                output = hear_model(spectrogram, return_dict=True)
-                embedding = output.last_hidden_state.mean(dim=1)  # pool over time
-                embedding_np = embedding.cpu().numpy()
+        if hear_model is not None and hear_classifier is not None and hear_feature_extractor is not None:
+            embedding_np = _hear_embed(audio, sr)
 
             # Classify with trained sklearn model
             prediction = hear_classifier.predict(embedding_np)[0]
@@ -336,23 +321,8 @@ def handle_cough(input_data):
             }
 
         # ── Path B: HeAR embeddings only (no classifier) ─────────────
-        elif hear_model is not None and audio_utils is not None:
-            device = next(hear_model.parameters()).device
-
-            target_length = 2 * sr
-            if len(audio) < target_length:
-                audio = np.pad(audio, (0, target_length - len(audio)))
-            else:
-                audio = audio[:target_length]
-
-            audio_tensor = torch.tensor(audio, dtype=torch.float32)
-            spectrogram = audio_utils.audio_to_spec(audio_tensor)
-            spectrogram = spectrogram.unsqueeze(0).to(device)
-
-            with torch.no_grad():
-                output = hear_model(spectrogram, return_dict=True)
-                embedding = output.last_hidden_state.mean(dim=1)
-                embedding_np = embedding.cpu().numpy()
+        elif hear_model is not None and hear_feature_extractor is not None:
+            embedding_np = _hear_embed(audio, sr)
 
             # Simple heuristic on embedding norm (rough proxy)
             emb_norm = float(np.linalg.norm(embedding_np))
