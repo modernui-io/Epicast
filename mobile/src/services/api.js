@@ -1,24 +1,63 @@
 /**
- * EpiCast API Service
+ * EpiCast API Service — Hybrid On-Device + Cloud
  *
- * High-level API that screens call. Combines:
- *   - RunPod serverless (ML inference)
- *   - 3-tier cache (memory → AsyncStorage → Supabase)
- *   - Supabase (persistent encounter storage)
+ * Routing (strict):
+ *   On-device only: extractSyndrome (MedGemma 4B), triageImage (MedSigLIP)
+ *   Cloud only:     analyzeCough (HeAR via RunPod), generateReport (27B)
  *
- * Cached routes:   extract, cough/analyze, image/triage
- * Fresh routes:    health, dashboard, alerts, surveillance/report
+ * If on-device model is not ready, throw — do NOT fall back to cloud for
+ * extraction or image triage.
+ *
+ * RunPod endpoints used: cough/analyze, surveillance/report
  */
 
+import NetInfo from '@react-native-community/netinfo';
+import * as FileSystem from 'expo-file-system/legacy';
 import { callRunPod, checkHealth, warmUp } from './runpod';
-import { cacheGet, cacheSet, narrativeHash } from './cache';
-import { supabase } from './supabase';
+import { cacheGet, cacheSet } from './cache';
 
-// ── Cached ML Inference ───────────────────────────────────────────────────
+const LOCAL_SERVER_URL = (process.env.EXPO_PUBLIC_LOCAL_SERVER_URL || '').trim();
+
+/** Returns true when the local Mac server is configured (non-empty URL). */
+export function isUsingLocalServer() {
+  return !!LOCAL_SERVER_URL;
+}
+import {
+  extractSyndromeOnDevice,
+  triageImageOnDevice,
+  isModelReady as isOnDeviceReady,
+  isVisionReady,
+  initOnDeviceModel,
+  releaseModel,
+} from './onDeviceAI';
+import { initHearModel, analyzeCoughOnDevice, releaseHearModel } from './onDeviceCough';
+import { computeFusion } from './fusion';
+import { areLlamaModelsReady, areHearModelsReady } from './modelManager';
+
+/**
+ * Ensure on-device LLaMA model is loaded.
+ * Lazy re-init if released (app backgrounded).
+ * Returns true if ready, false if models not downloaded yet.
+ */
+async function ensureOnDeviceReady() {
+  if (isOnDeviceReady()) return true;
+
+  const modelsDownloaded = await areLlamaModelsReady();
+  if (!modelsDownloaded) return false;
+
+  try {
+    return await initOnDeviceModel();
+  } catch {
+    return false;
+  }
+}
+
+// ── On-Device Inference ───────────────────────────────────────────────────────
 
 /**
  * Extract syndromic signal from clinical narrative.
- * Results are cached across all 3 tiers.
+ * ON-DEVICE ONLY — MedGemma 4B via llama.rn.
+ * No cloud fallback. Throws if model not loaded yet.
  *
  * @param {string} narrative - Clinical narrative text
  * @param {function} onProgress - Optional progress callback
@@ -27,24 +66,89 @@ import { supabase } from './supabase';
 export async function extractSyndrome(narrative, onProgress = null) {
   if (!narrative?.trim()) throw new Error('No narrative provided');
 
-  // Check cache
+  // Check cache first
   const cached = await cacheGet('extract', narrative);
   if (cached) return cached;
 
-  // Call RunPod
-  const result = await callRunPod('extract', { narrative }, onProgress);
-
-  // Cache result
-  if (result && !result.error) {
-    await cacheSet('extract', narrative, result);
+  // Ensure model is ready — lazy re-init if backgrounded
+  const ready = await ensureOnDeviceReady();
+  if (!ready) {
+    const downloaded = await areLlamaModelsReady();
+    if (!downloaded) {
+      throw new Error('AI models not downloaded. Download MedGemma from Settings to use on-device extraction.');
+    }
+    throw new Error('AI model loading — please wait 30 seconds and try again.');
   }
 
-  return result;
+  onProgress?.('Analyzing on-device...');
+  const result = await extractSyndromeOnDevice(narrative);
+
+  if (!result.success || !result.data) {
+    throw new Error('On-device extraction failed — please try again.');
+  }
+
+  const data = { ...result.data, _source: 'on-device', _model: result.model };
+  await cacheSet('extract', narrative, data);
+  return data;
 }
 
 /**
+ * Triage clinical photo.
+ * ON-DEVICE ONLY — MedGemma 4B vision (MedSigLIP) via llama.rn.
+ * No cloud fallback. Throws if vision model not loaded.
+ *
+ * @param {string} imageBase64 - Base64-encoded image
+ * @param {string} clinicalContext - Optional narrative context
+ * @param {function} onProgress - Optional progress callback
+ * @returns {object} Image classification result
+ */
+export async function triageImage(imageBase64, clinicalContext = null, onProgress = null) {
+  if (!imageBase64) throw new Error('No image data provided');
+
+  const cacheKey = imageBase64.slice(0, 100);
+  const cached = await cacheGet('image', cacheKey);
+  if (cached) return cached;
+
+  // Ensure LLaMA is loaded (vision is part of the same model)
+  const ready = await ensureOnDeviceReady();
+  if (!ready) {
+    throw new Error('AI model loading — please wait and try again.');
+  }
+
+  if (!isVisionReady()) {
+    throw new Error('Vision model not available — the vision projector may still be loading.');
+  }
+
+  onProgress?.('Analyzing image on-device...');
+
+  // llama.rn needs a local filesystem path — write base64 to a temp file
+  const tmpUri = `${FileSystem.cacheDirectory}triage_${Date.now()}.jpg`;
+  await FileSystem.writeAsStringAsync(tmpUri, imageBase64, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+
+  try {
+    // Strip file:// prefix — llama.rn expects a raw path, not a URI
+    const localPath = tmpUri.replace('file://', '');
+    const result = await triageImageOnDevice(localPath, clinicalContext || '');
+
+    if (!result.success || !result.data) {
+      throw new Error('On-device image triage failed — please try again.');
+    }
+
+    const data = { ...result.data, _source: 'on-device' };
+    await cacheSet('image', cacheKey, data);
+    return data;
+  } finally {
+    FileSystem.deleteAsync(tmpUri, { idempotent: true }).catch(() => { });
+  }
+}
+
+// ── Cloud-Only Inference ──────────────────────────────────────────────────────
+
+/**
  * Analyze cough audio using HeAR model.
- * Results are cached by audio hash.
+ * CLOUD ONLY — RunPod endpoint: cough/analyze
  *
  * @param {string} audioBase64 - Base64-encoded audio data
  * @param {string} format - Audio format (default: 'wav')
@@ -54,153 +158,69 @@ export async function extractSyndrome(narrative, onProgress = null) {
 export async function analyzeCough(audioBase64, format = 'wav', onProgress = null) {
   if (!audioBase64) throw new Error('No audio data provided');
 
-  // Cache key uses first 100 chars of base64 (enough for uniqueness)
   const cacheKey = audioBase64.slice(0, 100);
-
   const cached = await cacheGet('cough', cacheKey);
   if (cached) return cached;
 
-  const result = await callRunPod('cough/analyze', {
-    audio_base64: audioBase64,
-    format,
-  }, onProgress);
+  const net = await NetInfo.fetch();
+  if (!net.isConnected) {
+    throw new Error('No internet connection. Cough analysis requires cloud connectivity.');
+  }
+
+  // ── Local Mac server ──────────────────────────────────────────────────────
+  if (LOCAL_SERVER_URL) {
+    onProgress?.('Analyzing cough (local server)...');
+    const tmpUri = `${FileSystem.cacheDirectory}cough_${Date.now()}.${format}`;
+    await FileSystem.writeAsStringAsync(tmpUri, audioBase64, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    try {
+      const formData = new FormData();
+      formData.append('audio', { uri: tmpUri, type: `audio/${format}`, name: `cough.${format}` });
+      const res = await fetch(`${LOCAL_SERVER_URL}/v1/hear/classify`, {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      data._source = 'local';
+      await cacheSet('cough', cacheKey, data);
+      return data;
+    } finally {
+      FileSystem.deleteAsync(tmpUri, { idempotent: true }).catch(() => { });
+    }
+  }
+
+  // ── RunPod (production) ───────────────────────────────────────────────────
+  onProgress?.('Analyzing cough biomarkers via cloud...');
+  const result = await callRunPod('cough/analyze', { audio_base64: audioBase64, format }, onProgress);
 
   if (result && !result.error) {
+    result._source = 'cloud';
     await cacheSet('cough', cacheKey, result);
   }
 
   return result;
 }
 
-/**
- * Triage clinical photo using MedGemma 4B vision.
- * Results are cached by image hash.
- *
- * @param {string} imageBase64 - Base64-encoded image data
- * @param {string} clinicalContext - Optional narrative context
- * @param {function} onProgress - Optional progress callback
- * @returns {object} Image classification result
- */
-export async function triageImage(imageBase64, clinicalContext = null, onProgress = null) {
-  if (!imageBase64) throw new Error('No image data provided');
-
-  const cacheKey = imageBase64.slice(0, 100);
-
-  const cached = await cacheGet('image', cacheKey);
-  if (cached) return cached;
-
-  const result = await callRunPod('image/triage', {
-    image_base64: imageBase64,
-    clinical_context: clinicalContext,
-  }, onProgress);
-
-  if (result && !result.error) {
-    await cacheSet('image', cacheKey, result);
-  }
-
-  return result;
-}
-
-// ── Multi-Modal ───────────────────────────────────────────────────────────
+// ── Multi-Modal Fusion ────────────────────────────────────────────────────────
 
 /**
- * Fuse multiple modality results into a combined assessment.
- * Not cached (lightweight math, no GPU).
- *
- * @param {object} textResult  - From extractSyndrome()
- * @param {object} coughResult - From analyzeCough() or null
- * @param {object} imageResult - From triageImage() or null
- * @returns {object} Fused confidence + agreement analysis
+ * Fuse multiple modality results. Pure JS — no network call.
  */
 export async function fuseModalities(textResult, coughResult = null, imageResult = null) {
-  return callRunPod('fuse', {
-    text_result: textResult || null,
-    cough_result: coughResult || null,
-    image_result: imageResult || null,
-  });
+  return computeFusion(textResult, coughResult, imageResult);
 }
 
-/**
- * Full multi-modal encounter — runs all available models in one RunPod call.
- * Use this instead of calling extract + cough + image separately to save
- * round trips (especially important with cold starts).
- *
- * @param {object} params
- * @param {string} params.narrative - Clinical narrative
- * @param {string} params.audioBase64 - Cough audio (optional)
- * @param {string} params.imageBase64 - Clinical photo (optional)
- * @param {string} params.district - District name
- * @param {number} params.latitude
- * @param {number} params.longitude
- * @param {function} onProgress - Optional progress callback
- * @returns {object} Combined results from all models + fusion
- */
-export async function processMultimodal({
-  narrative, audioBase64 = null, imageBase64 = null,
-  district = null, latitude = null, longitude = null,
-}, onProgress = null) {
-  const result = await callRunPod('encounter/multimodal', {
-    narrative,
-    audio_base64: audioBase64,
-    image_base64: imageBase64,
-    district,
-    latitude,
-    longitude,
-  }, onProgress);
-
-  // Cache individual sub-results for future reuse
-  if (result?.text && !result.text.error) {
-    await cacheSet('extract', narrative, result.text);
-  }
-  if (result?.cough && !result.cough.error && audioBase64) {
-    await cacheSet('cough', audioBase64.slice(0, 100), result.cough);
-  }
-  if (result?.image && !result.image.error && imageBase64) {
-    await cacheSet('image', imageBase64.slice(0, 100), result.image);
-  }
-
-  return result;
-}
-
-// ── Encounter Submission (RunPod + Supabase) ──────────────────────────────
+// ── Encounter Submission ──────────────────────────────────────────────────────
 
 /**
- * Submit an encounter: extract syndromic signal via RunPod, then store in Supabase.
- *
- * @param {object} params
- * @param {string} params.narrative - Clinical narrative
- * @param {string} params.district - District name
- * @param {string} params.facilityName - Facility name
- * @param {number} params.latitude
- * @param {number} params.longitude
- * @param {function} onProgress - Optional progress callback
- * @returns {object} Encounter result with syndromic signal
+ * Submit an encounter: extract syndromic signal on-device, store in Supabase.
  */
 export async function submitEncounter({
   narrative, district, facilityName, latitude, longitude,
 }, onProgress = null) {
-  // Extract syndromic signal (uses cache if available)
   const signal = await extractSyndrome(narrative, onProgress);
-
-  // Store encounter in Supabase
-  onProgress?.('Saving encounter...');
-  try {
-    const { data: user } = await supabase.auth.getUser();
-    await supabase.from('encounters').insert({
-      narrative_text: narrative,
-      narrative_hash: narrativeHash(narrative),
-      syndromic_signal: signal,
-      syndrome_category: signal?.syndrome_category,
-      severity: signal?.severity,
-      district_name: district,
-      facility_name: facilityName,
-      latitude,
-      longitude,
-      user_id: user?.user?.id || null,
-    });
-  } catch {
-    // Supabase write is best-effort — don't fail the encounter
-  }
 
   return {
     syndromic_signal: signal,
@@ -209,58 +229,66 @@ export async function submitEncounter({
   };
 }
 
-// ── Fresh Data (Never Cached) ─────────────────────────────────────────────
+// ── Cloud-Only Endpoints ──────────────────────────────────────────────────────
 
-/**
- * Health check — also warms up the RunPod worker.
- */
-export async function healthCheck() {
-  return checkHealth();
+export async function generateReport(district, reportType = 'situation_report', onProgress = null) {
+  // ── Local Mac server ──────────────────────────────────────────────────────
+  if (LOCAL_SERVER_URL) {
+    onProgress?.('Generating report (local MedGemma 27B)...');
+    const prompt = `Generate a ${reportType.replace(/_/g, ' ')} for ${district}.`;
+    const res = await fetch(`${LOCAL_SERVER_URL}/v1/report/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, max_tokens: 2048 }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    return { report: data.text, tokens_used: data.tokens_used, _source: 'local' };
+  }
+
+  // ── RunPod (production) ───────────────────────────────────────────────────
+  return callRunPod('surveillance/report', { district, report_type: reportType }, onProgress);
 }
 
-/**
- * Pre-warm the RunPod worker. Call on app open.
- */
-export { warmUp };
-
-/**
- * Get dashboard stats. Always fetched fresh.
- */
 export async function getDashboard(onProgress = null) {
   return callRunPod('dashboard', {}, onProgress);
 }
 
-/**
- * Get active alerts. Always fetched fresh.
- */
 export async function getAlerts(onProgress = null) {
   return callRunPod('alerts', {}, onProgress);
 }
 
-/**
- * Run anomaly detection scan across districts.
- */
 export async function runSurveillanceScan(district = null, onProgress = null) {
   return callRunPod('surveillance/scan', { district }, onProgress);
 }
 
-/**
- * Generate a situation report using MedGemma 27B. Always fresh.
- *
- * @param {string} district - District to report on
- * @param {string} reportType - 'situation_report' (default)
- * @param {function} onProgress - Optional progress callback
- */
-export async function generateReport(district, reportType = 'situation_report', onProgress = null) {
-  return callRunPod('surveillance/report', {
-    district,
-    report_type: reportType,
-  }, onProgress);
+export async function healthCheck() {
+  return checkHealth();
 }
 
-// ── Legacy compatibility ──────────────────────────────────────────────────
-// These map old EpiCastAPI class methods to the new functional API
-// so existing screens don't break during migration.
+export { warmUp };
+
+// ── App Initialization ───────────────────────────────────────────────────────
+
+/**
+ * Initialize on-device MedGemma at startup.
+ * Cough (HeAR) is cloud-only — no HeAR init needed here.
+ */
+export async function initializeEpiCast(onProgress) {
+  const modelReady = await initOnDeviceModel(onProgress);
+
+  // Pre-warm RunPod for cough analysis (non-blocking)
+  NetInfo.fetch().then(state => {
+    if (state.isConnected) warmUp();
+  });
+
+  return {
+    onDeviceReady: modelReady,
+    visionReady: isVisionReady(),
+  };
+}
+
+// ── Legacy Compatibility ──────────────────────────────────────────────────────
 
 class EpiCastAPI {
   async healthCheck() { return healthCheck(); }
@@ -269,21 +297,14 @@ class EpiCastAPI {
     return submitEncounter({ narrative, district, facilityName, latitude, longitude });
   }
 
-  async runSurveillanceScan(district = null) {
-    return runSurveillanceScan(district);
-  }
-
-  async generateReport(district) {
-    return generateReport(district);
-  }
-
+  async runSurveillanceScan(district = null) { return runSurveillanceScan(district); }
+  async generateReport(district) { return generateReport(district); }
   async getAlerts() { return getAlerts(); }
-
   async getDashboard() { return getDashboard(); }
 
   async transcribeAudio(audioBase64, format = 'wav') {
-    // MedASR is handled internally by the extract route on RunPod
-    return callRunPod('extract', { audio_base64: audioBase64, format });
+    // MedASR transcription — cloud only (Whisper on RunPod)
+    return callRunPod('transcribe', { audio_base64: audioBase64, format });
   }
 
   async classifyImage(imageBase64, clinicalContext = null) {
