@@ -169,14 +169,15 @@ def hear_classify():
         input_name = hear_session.get_inputs()[0].name
         outputs = hear_session.run(None, {input_name: mel})
 
-        # The embedding is the pooled output (512-dim)
-        # Depending on ONNX export, it might be outputs[0] or outputs[-1]
+        # HeAR outputs [batch, n_windows, 512] — flatten to [batch, n_windows*512]
+        # classifier.onnx was trained on flattened (1024-dim = 2 windows × 512)
         embedding = outputs[0]
+        log.info(f"Raw HeAR output shape: {embedding.shape}")
         if len(embedding.shape) == 3:
-            # [batch, seq, hidden] -> pool
-            embedding = embedding.mean(axis=1)
+            # [batch, seq, hidden] -> [batch, seq*hidden]  (e.g. [1,2,512] -> [1,1024])
+            embedding = embedding.reshape(embedding.shape[0], -1)
         embedding = embedding.reshape(1, -1)
-        log.info(f"Embedding shape: {embedding.shape}")
+        log.info(f"Embedding shape after flatten: {embedding.shape}")
 
         # Run ONNX classifier
         clf_input_name = clf_session.get_inputs()[0].name
@@ -227,7 +228,7 @@ def hear_embed():
 
         embedding = outputs[0]
         if len(embedding.shape) == 3:
-            embedding = embedding.mean(axis=1)
+            embedding = embedding.reshape(embedding.shape[0], -1)
         embedding = embedding.reshape(-1)
 
         return jsonify({
