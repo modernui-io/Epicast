@@ -124,9 +124,8 @@ def audio_to_mel_spectrogram(audio_bytes):
     else:
         mel = mel[:, :target_time]
 
-    # HeAR expects [batch, channels, freq, time] = [1, 1, 128, 192]
-    # But our ONNX might expect [1, 1, 192, 128] depending on export
-    mel_tensor = mel[np.newaxis, np.newaxis, :, :].astype(np.float32)
+    # HeAR ONNX expects [batch, channels, time, freq] = [1, 1, 192, 128]
+    mel_tensor = mel.T[np.newaxis, np.newaxis, :, :].astype(np.float32)
 
     return mel_tensor
 
