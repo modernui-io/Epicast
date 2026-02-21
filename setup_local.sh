@@ -33,14 +33,22 @@ mkdir -p models/hear models/medgemma-27b
 
 # HeAR ONNX + classifier
 echo "  Downloading HeAR ONNX..."
-python -m huggingface_hub download Janeodum/epicast-hear-mobile --local-dir ./models/hear
+python - <<'PYEOF'
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id="Janeodum/epicast-hear-mobile", local_dir="./models/hear")
+PYEOF
 
 # MedGemma 27B GGUF - Q3_K_M (13.4GB, fits in 18GB RAM with headroom)
 echo ""
 echo "  Downloading MedGemma 27B Q3_K_M (13.4 GB)..."
-python -m huggingface_hub download bartowski/google_medgemma-27b-it-GGUF \
-    --include "google_medgemma-27b-it-Q3_K_M.gguf" \
-    --local-dir ./models/medgemma-27b
+python - <<'PYEOF'
+from huggingface_hub import hf_hub_download
+hf_hub_download(
+    repo_id="bartowski/google_medgemma-27b-it-GGUF",
+    filename="google_medgemma-27b-it-Q3_K_M.gguf",
+    local_dir="./models/medgemma-27b",
+)
+PYEOF
 
 # 4. Instructions
 echo ""
