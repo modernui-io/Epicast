@@ -38,19 +38,19 @@ CORS(app)
 # ============================================================
 MODELS_DIR = os.environ.get("MODELS_DIR", "./models")
 HEAR_ONNX_PATH = os.path.join(MODELS_DIR, "hear", "hear_embedding.onnx")
-HEAR_CLF_PATH = os.path.join(MODELS_DIR, "hear", "epicast_cough_classifier.joblib")
+HEAR_CLF_PATH = os.path.join(MODELS_DIR, "hear", "classifier.onnx")
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://localhost:8081")
 
 LABEL_NAMES = {0: "healthy", 1: "symptomatic", 2: "COVID-19"}
 
 # ============================================================
-# LOAD HeAR ONNX + CLASSIFIER
+# LOAD HeAR ONNX + CLASSIFIER (both ONNX)
 # ============================================================
 hear_session = None
-hear_classifier = None
+clf_session = None  # ONNX sklearn classifier
 
 def load_hear():
-    global hear_session, hear_classifier
+    global hear_session, clf_session
     try:
         import onnxruntime as ort
 
@@ -66,10 +66,9 @@ def load_hear():
         hear_session = ort.InferenceSession(HEAR_ONNX_PATH, providers=providers)
         log.info("HeAR ONNX loaded")
 
-        import joblib
-        log.info(f"Loading classifier from {HEAR_CLF_PATH}")
-        hear_classifier = joblib.load(HEAR_CLF_PATH)
-        log.info("Classifier loaded")
+        log.info(f"Loading classifier ONNX from {HEAR_CLF_PATH}")
+        clf_session = ort.InferenceSession(HEAR_CLF_PATH, providers=["CPUExecutionProvider"])
+        log.info("Classifier ONNX loaded")
 
     except FileNotFoundError as e:
         log.warning(f"HeAR models not found: {e}")
@@ -141,7 +140,7 @@ def health():
     return jsonify({
         "status": "ok",
         "hear_loaded": hear_session is not None,
-        "classifier_loaded": hear_classifier is not None,
+        "classifier_loaded": clf_session is not None,
         "llama_server": LLAMA_SERVER_URL,
     })
 
@@ -153,7 +152,7 @@ def hear_classify():
     Accepts: multipart/form-data with 'audio' file
     Returns: {prediction, confidence, probabilities, embedding_dim}
     """
-    if hear_session is None or hear_classifier is None:
+    if hear_session is None or clf_session is None:
         return jsonify({"error": "HeAR models not loaded"}), 503
 
     if "audio" not in request.files:
@@ -180,12 +179,19 @@ def hear_classify():
         embedding = embedding.reshape(1, -1)
         log.info(f"Embedding shape: {embedding.shape}")
 
-        # Classify
-        prediction = hear_classifier.predict(embedding)[0]
-        probabilities = hear_classifier.predict_proba(embedding)[0]
+        # Run ONNX classifier
+        clf_input_name = clf_session.get_inputs()[0].name
+        clf_outputs = clf_session.run(None, {clf_input_name: embedding.astype(np.float32)})
+        # sklearn-to-onnx exports: output[0] = labels, output[1] = list of {class: prob} dicts
+        prediction = int(clf_outputs[0][0])
+        prob_map = clf_outputs[1][0] if len(clf_outputs) > 1 else {}
+        if isinstance(prob_map, dict):
+            probabilities = [prob_map.get(i, 0.0) for i in range(len(LABEL_NAMES))]
+        else:
+            probabilities = list(prob_map)
 
         return jsonify({
-            "prediction": LABEL_NAMES.get(int(prediction), str(prediction)),
+            "prediction": LABEL_NAMES.get(prediction, str(prediction)),
             "confidence": float(max(probabilities)),
             "probabilities": {
                 LABEL_NAMES.get(i, str(i)): float(p)
