@@ -177,10 +177,18 @@ export async function analyzeCough(audioBase64, format = 'wav', onProgress = nul
     try {
       const formData = new FormData();
       formData.append('audio', { uri: tmpUri, type: `audio/${format}`, name: `cough.${format}` });
-      const res = await fetch(`${LOCAL_SERVER_URL}/v1/hear/classify`, {
-        method: 'POST',
-        body: formData,
-      });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 90000); // 90s — HeAR on CPU is slow
+      let res;
+      try {
+        res = await fetch(`${LOCAL_SERVER_URL}/v1/hear/classify`, {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
       const data = await res.json();
       if (data.error) throw new Error(data.error);
       data._source = 'local';

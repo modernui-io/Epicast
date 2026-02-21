@@ -165,18 +165,15 @@ def hear_classify():
         mel = audio_to_mel_spectrogram(audio_bytes)
         log.info(f"Mel spectrogram shape: {mel.shape}")
 
-        # Run HeAR ONNX inference
-        input_name = hear_session.get_inputs()[0].name
-        outputs = hear_session.run(None, {input_name: mel})
-
         # classifier.onnx expects 1024-dim = two 512-dim HeAR windows concatenated.
         # Run HeAR on first half (0-1s) and second half (1-2s) of the mel separately.
-        mel_a = np.pad(mel[:, :, :96, :], ((0,0),(0,0),(0,96),(0,0)))   # first second, padded to 192
-        mel_b = np.pad(mel[:, :, 96:, :], ((0,0),(0,0),(0,96),(0,0)))  # second second, padded to 192
-        emb_a = hear_session.run(None, {input_name: mel_a})[0]  # [1, 512]
-        emb_b = hear_session.run(None, {input_name: mel_b})[0]  # [1, 512]
-        embedding = np.concatenate([emb_a, emb_b], axis=1)      # [1, 1024]
-        log.info(f"Embedding shape (2-window concat): {embedding.shape}")
+        input_name = hear_session.get_inputs()[0].name
+        mel_a = np.pad(mel[:, :, :96, :], ((0,0),(0,0),(0,96),(0,0)))  # first second → [1,1,192,128]
+        mel_b = np.pad(mel[:, :, 96:, :], ((0,0),(0,0),(0,96),(0,0)))  # second second → [1,1,192,128]
+        emb_a = hear_session.run(None, {input_name: mel_a})[0]          # [1, 512]
+        emb_b = hear_session.run(None, {input_name: mel_b})[0]          # [1, 512]
+        embedding = np.concatenate([emb_a, emb_b], axis=1)              # [1, 1024]
+        log.info(f"Embedding shape: {embedding.shape}")
 
         # Run ONNX classifier
         clf_input_name = clf_session.get_inputs()[0].name
