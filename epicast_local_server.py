@@ -169,15 +169,14 @@ def hear_classify():
         input_name = hear_session.get_inputs()[0].name
         outputs = hear_session.run(None, {input_name: mel})
 
-        # HeAR outputs [batch, n_windows, 512] — flatten to [batch, n_windows*512]
-        # classifier.onnx was trained on flattened (1024-dim = 2 windows × 512)
-        embedding = outputs[0]
-        log.info(f"Raw HeAR output shape: {embedding.shape}")
-        if len(embedding.shape) == 3:
-            # [batch, seq, hidden] -> [batch, seq*hidden]  (e.g. [1,2,512] -> [1,1024])
-            embedding = embedding.reshape(embedding.shape[0], -1)
-        embedding = embedding.reshape(1, -1)
-        log.info(f"Embedding shape after flatten: {embedding.shape}")
+        # classifier.onnx expects 1024-dim = two 512-dim HeAR windows concatenated.
+        # Run HeAR on first half (0-1s) and second half (1-2s) of the mel separately.
+        mel_a = np.pad(mel[:, :, :96, :], ((0,0),(0,0),(0,96),(0,0)))   # first second, padded to 192
+        mel_b = np.pad(mel[:, :, 96:, :], ((0,0),(0,0),(0,96),(0,0)))  # second second, padded to 192
+        emb_a = hear_session.run(None, {input_name: mel_a})[0]  # [1, 512]
+        emb_b = hear_session.run(None, {input_name: mel_b})[0]  # [1, 512]
+        embedding = np.concatenate([emb_a, emb_b], axis=1)      # [1, 1024]
+        log.info(f"Embedding shape (2-window concat): {embedding.shape}")
 
         # Run ONNX classifier
         clf_input_name = clf_session.get_inputs()[0].name
