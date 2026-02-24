@@ -1,18 +1,20 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, RefreshControl,
-  Dimensions, ActivityIndicator,
+  Dimensions, ActivityIndicator, TouchableOpacity,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Colors, Typography, Spacing, BorderRadius, Shadows, SyndromeLabels, AlertLevelConfig } from '../utils/theme';
 import { supabase } from '../services/supabase';
+import { getDashboardOverview, getSyndromeBreakdown, getRecentEncounters } from '../services/dashboardData';
+import { getQueueStatus } from '../services/offlineQueue';
 
 const { width: SW } = Dimensions.get('window');
 
-function StatCard({ label, value, icon, color, subtitle }) {
-  return (
+function StatCard({ label, value, icon, color, subtitle, onPress }) {
+  const card = (
     <View style={styles.statCard}>
       <View style={styles.statIcon}>
         <Ionicons name={icon} size={18} color={color} />
@@ -20,15 +22,20 @@ function StatCard({ label, value, icon, color, subtitle }) {
       <Text style={styles.statValue}>{value}</Text>
       <Text style={styles.statLabel}>{label}</Text>
       {subtitle && <Text style={styles.statSubtitle}>{subtitle}</Text>}
+      {onPress && <Ionicons name="chevron-forward" size={12} color={Colors.text.tertiary} style={styles.cardChevron} />}
     </View>
   );
+  if (onPress) {
+    return <TouchableOpacity onPress={onPress} activeOpacity={0.7}>{card}</TouchableOpacity>;
+  }
+  return card;
 }
 
-function SyndromeBar({ syndrome, count, maxCount }) {
+function SyndromeBar({ syndrome, count, maxCount, onPress }) {
   const color = Colors.syndrome[syndrome] || Colors.text.tertiary;
   const label = SyndromeLabels[syndrome] || syndrome;
   const barWidth = maxCount > 0 ? (count / maxCount) * 100 : 0;
-  return (
+  const row = (
     <View style={styles.syndromeRow}>
       <View style={styles.syndromeInfo}>
         <View style={[styles.syndromeDot, { backgroundColor: color }]} />
@@ -40,14 +47,18 @@ function SyndromeBar({ syndrome, count, maxCount }) {
       <Text style={[styles.syndromeCount, { color }]}>{count}</Text>
     </View>
   );
+  if (onPress) {
+    return <TouchableOpacity onPress={onPress} activeOpacity={0.7}>{row}</TouchableOpacity>;
+  }
+  return row;
 }
 
-function EncounterRow({ encounter }) {
+function EncounterRow({ encounter, onPress }) {
   const sevColors = { mild: Colors.severity.low, moderate: Colors.severity.watch, severe: Colors.severity.warning, critical: Colors.severity.emergency };
   const color = sevColors[encounter.severity] || Colors.text.tertiary;
   const name = SyndromeLabels[encounter.syndrome_category] || encounter.syndrome_category || 'Unknown';
   const timeAgo = getTimeAgo(encounter.created_at);
-  return (
+  const row = (
     <View style={styles.encounterRow}>
       <View style={[styles.encounterDot, { backgroundColor: color }]} />
       <View style={{ flex: 1 }}>
@@ -59,6 +70,10 @@ function EncounterRow({ encounter }) {
       </View>
     </View>
   );
+  if (onPress) {
+    return <TouchableOpacity onPress={onPress} activeOpacity={0.7}>{row}</TouchableOpacity>;
+  }
+  return row;
 }
 
 function getTimeAgo(dateStr) {
@@ -73,63 +88,44 @@ function getTimeAgo(dateStr) {
   return `${days}d ago`;
 }
 
-export default function DashboardScreen() {
+export default function DashboardScreen({ navigation }) {
   const insets = useSafeAreaInsets();
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [dataSource, setDataSource] = useState('demo');
 
   const [totalEncounters, setTotalEncounters] = useState(0);
+  const [weekChange, setWeekChange] = useState(0);
+  const [severeCount, setSevereCount] = useState(0);
   const [totalAlerts, setTotalAlerts] = useState(0);
   const [alertsByLevel, setAlertsByLevel] = useState({});
   const [districtCount, setDistrictCount] = useState(0);
   const [syndromeDist, setSyndromeDist] = useState({});
   const [recentEncounters, setRecentEncounters] = useState([]);
+  const [queueStatus, setQueueStatus] = useState({ pending: 0 });
 
   const fetchData = useCallback(async () => {
     try {
-      // Total encounters
-      const { count: encCount } = await supabase
-        .from('encounters')
-        .select('id', { count: 'exact', head: true });
-      setTotalEncounters(encCount || 0);
+      // Offline queue status
+      const qs = await getQueueStatus();
+      setQueueStatus(qs);
 
-      // Alerts
-      const { data: alerts } = await supabase
-        .from('alerts')
-        .select('alert_level')
-        .eq('is_active', true);
-      const byLevel = {};
-      (alerts || []).forEach(a => { byLevel[a.alert_level] = (byLevel[a.alert_level] || 0) + 1; });
-      setTotalAlerts((alerts || []).length);
-      setAlertsByLevel(byLevel);
+      // Dashboard overview (this week vs last week)
+      const overview = await getDashboardOverview();
+      setTotalEncounters(overview.totalEncounters);
+      setWeekChange(overview.weekChange);
+      setSevereCount(overview.severeCount);
+      setDistrictCount(overview.activeDistricts);
 
-      // Districts count
-      const { count: dCount } = await supabase
-        .from('districts')
-        .select('id', { count: 'exact', head: true });
-      setDistrictCount(dCount || 0);
-
-      // Syndrome distribution from encounters
-      const { data: encounters } = await supabase
-        .from('encounters')
-        .select('syndrome_category')
-        .not('syndrome_category', 'is', null);
+      // Syndrome breakdown
+      const breakdown = await getSyndromeBreakdown(null, 4);
       const dist = {};
-      (encounters || []).forEach(e => {
-        if (e.syndrome_category) dist[e.syndrome_category] = (dist[e.syndrome_category] || 0) + 1;
-      });
+      breakdown.forEach(({ syndrome, count }) => { dist[syndrome] = count; });
       setSyndromeDist(dist);
 
       // Recent encounters with district name
-      const { data: recent } = await supabase
-        .from('encounters')
-        .select('id, syndrome_category, severity, created_at, district_id')
-        .order('created_at', { ascending: false })
-        .limit(6);
-
-      // Get district names for recent encounters
-      const districtIds = [...new Set((recent || []).map(e => e.district_id).filter(Boolean))];
+      const recent = await getRecentEncounters(null, 6);
+      const districtIds = [...new Set(recent.map(e => e.district_id).filter(Boolean))];
       let districtMap = {};
       if (districtIds.length > 0) {
         const { data: districts } = await supabase
@@ -138,11 +134,20 @@ export default function DashboardScreen() {
           .in('id', districtIds);
         (districts || []).forEach(d => { districtMap[d.id] = d.name; });
       }
-
-      setRecentEncounters((recent || []).map(e => ({
+      setRecentEncounters(recent.map(e => ({
         ...e,
         district_name: districtMap[e.district_id] || 'Unknown',
       })));
+
+      // Alerts from existing alerts table
+      const { data: alerts } = await supabase
+        .from('alerts')
+        .select('alert_level')
+        .eq('is_active', true);
+      const byLevel = {};
+      (alerts || []).forEach(a => { byLevel[a.alert_level] = (byLevel[a.alert_level] || 0) + 1; });
+      setTotalAlerts((alerts || []).length);
+      setAlertsByLevel(byLevel);
 
       setDataSource('live');
     } catch {
@@ -154,6 +159,8 @@ export default function DashboardScreen() {
       setDistrictCount(DEMO_DASH.districts.length);
       setSyndromeDist(DEMO_DASH.syndrome_distribution);
       setRecentEncounters(DEMO_DASH.recent_encounters);
+      setSevereCount(3);
+      setWeekChange(12);
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -174,6 +181,7 @@ export default function DashboardScreen() {
 
   const synEntries = Object.entries(syndromeDist).sort((a, b) => b[1] - a[1]);
   const maxSyn = synEntries.length > 0 ? synEntries[0][1] : 1;
+  const weekChangeLabel = weekChange > 0 ? `+${weekChange}% vs last wk` : weekChange < 0 ? `${weekChange}% vs last wk` : 'vs last wk';
 
   return (
     <View style={styles.container}>
@@ -182,6 +190,16 @@ export default function DashboardScreen() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.accent.primary} />}
         showsVerticalScrollIndicator={false}
       >
+        {/* Offline pending banner */}
+        {queueStatus.pending > 0 && (
+          <View style={styles.offlineBanner}>
+            <Ionicons name="cloud-upload-outline" size={14} color={Colors.severity.watch} />
+            <Text style={styles.offlineBannerText}>
+              {queueStatus.pending} encounter{queueStatus.pending > 1 ? 's' : ''} queued — will sync when online
+            </Text>
+          </View>
+        )}
+
         {/* Gradient Header */}
         <LinearGradient
           colors={['#10B981', '#14B8A6', '#06B6D4']}
@@ -236,17 +254,55 @@ export default function DashboardScreen() {
 
         {/* Stats Grid */}
         <View style={styles.statsGrid}>
-          <StatCard label="Encounters" value={totalEncounters} icon="people" color={Colors.accent.primary} subtitle="Total processed" />
-          <StatCard label="Active Alerts" value={totalAlerts} icon="alert-circle" color={alertsByLevel.emergency > 0 ? Colors.severity.emergency : Colors.severity.watch} subtitle="Monitoring" />
-          <StatCard label="Districts" value={districtCount} icon="location" color={Colors.accent.secondary} subtitle="Under surveillance" />
-          <StatCard label="Syndromes" value={Object.keys(syndromeDist).length} icon="analytics" color="#8B5CF6" subtitle="Tracked" />
+          <StatCard
+            label="Encounters"
+            value={totalEncounters}
+            icon="people"
+            color={Colors.accent.primary}
+            subtitle={weekChangeLabel}
+            onPress={() => navigation.navigate('DistrictDetail', { districtId: null, districtName: 'All Districts' })}
+          />
+          <StatCard
+            label="Active Alerts"
+            value={totalAlerts}
+            icon="alert-circle"
+            color={alertsByLevel.emergency > 0 ? Colors.severity.emergency : Colors.severity.watch}
+            subtitle="Monitoring"
+          />
+          <StatCard
+            label="Severe Cases"
+            value={severeCount}
+            icon="warning"
+            color={Colors.severity.warning}
+            subtitle="This week"
+            onPress={() => navigation.navigate('DistrictDetail', { districtId: null, districtName: 'All Districts', filterSeverity: true })}
+          />
+          <StatCard
+            label="Districts"
+            value={districtCount}
+            icon="location"
+            color="#8B5CF6"
+            subtitle="Reporting this week"
+          />
         </View>
 
         {/* Syndrome Distribution */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Syndrome Distribution</Text>
           <View style={styles.card}>
-            {synEntries.map(([s, c]) => <SyndromeBar key={s} syndrome={s} count={c} maxCount={maxSyn} />)}
+            {synEntries.map(([s, c]) => (
+              <SyndromeBar
+                key={s}
+                syndrome={s}
+                count={c}
+                maxCount={maxSyn}
+                onPress={() => navigation.navigate('DistrictDetail', {
+                  districtId: null,
+                  districtName: 'All Districts',
+                  syndrome: s,
+                })}
+              />
+            ))}
             {synEntries.length === 0 && <Text style={styles.emptyText}>No encounters recorded yet</Text>}
           </View>
         </View>
@@ -255,7 +311,16 @@ export default function DashboardScreen() {
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Recent Encounters</Text>
           <View style={styles.card}>
-            {recentEncounters.slice(0, 6).map((e, i) => <EncounterRow key={e.id || i} encounter={e} />)}
+            {recentEncounters.slice(0, 6).map((e, i) => (
+              <EncounterRow
+                key={e.id || i}
+                encounter={e}
+                onPress={e.district_id ? () => navigation.navigate('DistrictDetail', {
+                  districtId: e.district_id,
+                  districtName: e.district_name || 'District',
+                }) : undefined}
+              />
+            ))}
             {recentEncounters.length === 0 && <Text style={styles.emptyText}>No encounters yet. Tap + to begin.</Text>}
           </View>
         </View>
@@ -263,7 +328,6 @@ export default function DashboardScreen() {
         {/* Footer */}
         <View style={styles.footer}>
           <Text style={styles.footerText}>Powered by MedGemma · MedASR · MedSigLIP</Text>
-          <Text style={[styles.footerText, { opacity: 0.5, marginTop: 4 }]}>Google Health AI Developer Foundations</Text>
         </View>
       </ScrollView>
     </View>
@@ -294,6 +358,18 @@ const DEMO_ALERTS = { total_alerts: 4, by_level: { emergency: 1, warning: 2, wat
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: Colors.bg.secondary },
   center: { justifyContent: 'center', alignItems: 'center' },
+
+  offlineBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: Colors.severity.watch + '15',
+    paddingHorizontal: Spacing.xl,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.severity.watch + '30',
+  },
+  offlineBannerText: { fontSize: 12, color: Colors.severity.watch, fontWeight: '500', flex: 1 },
 
   header: { paddingHorizontal: Spacing.xl, paddingBottom: 24, borderBottomLeftRadius: BorderRadius.xl, borderBottomRightRadius: BorderRadius.xl },
   headerTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
@@ -333,6 +409,7 @@ const styles = StyleSheet.create({
   statValue: { fontSize: 24, fontWeight: '500', color: Colors.text.primary, letterSpacing: -0.5 },
   statLabel: { fontSize: 11, color: Colors.text.secondary, fontWeight: '500', marginTop: 2 },
   statSubtitle: { fontSize: 10, color: Colors.text.tertiary, marginTop: 1 },
+  cardChevron: { position: 'absolute', top: 12, right: 12 },
 
   section: { paddingHorizontal: Spacing.xl, marginBottom: 24 },
   sectionTitle: { fontSize: 12, color: Colors.text.tertiary, fontWeight: '500', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10 },
@@ -344,7 +421,7 @@ const styles = StyleSheet.create({
   syndromeLabel: { fontSize: 10, color: Colors.text.secondary, flex: 1 },
   syndromeBarBg: { flex: 1, height: 5, backgroundColor: Colors.bg.elevated, borderRadius: 3, marginHorizontal: 8, overflow: 'hidden' },
   syndromeBarFill: { height: '100%', borderRadius: 3 },
-  syndromeCount: { fontSize: 12, fontWeight: '600', width: 26, textAlign: 'right' },
+  syndromeCount: { fontSize: 12, fontWeight: '600', minWidth: 44, textAlign: 'right' },
 
   encounterRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: Colors.divider },
   encounterDot: { width: 8, height: 8, borderRadius: 4, marginRight: 10 },

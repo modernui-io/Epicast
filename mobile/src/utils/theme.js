@@ -45,16 +45,16 @@ export const Colors = {
     critical: '#DC2626',
   },
 
-  // Syndrome category colors — muted and elegant
+  // Syndrome category colors — distinct and easy to differentiate
   syndrome: {
-    acute_watery_diarrhea: '#06B6D4',
-    acute_bloody_diarrhea: '#F97316',
-    acute_febrile_illness: '#EF4444',
-    acute_respiratory_infection: '#8B5CF6',
-    acute_neurological_syndrome: '#EC4899',
-    acute_rash_fever: '#F59E0B',
-    acute_hemorrhagic_fever: '#DC2626',
-    unexplained_cluster: '#6B7280',
+    acute_watery_diarrhea: '#0EA5E9',      // Sky blue
+    acute_bloody_diarrhea: '#F97316',       // Orange
+    acute_febrile_illness: '#EF4444',       // Red
+    acute_respiratory_infection: '#8B5CF6', // Purple
+    acute_neurological_syndrome: '#EC4899', // Pink
+    acute_rash_fever: '#EAB308',            // Yellow (was amber, too close to orange)
+    acute_hemorrhagic_fever: '#991B1B',     // Dark red (was same red as febrile)
+    unexplained_cluster: '#6B7280',         // Gray
   },
 
   // Chart colors (for ForecastChart)

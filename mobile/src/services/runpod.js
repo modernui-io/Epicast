@@ -8,7 +8,12 @@
  *
  * Cold starts take 3-5 min (model loading). This client shows
  * user-friendly progress messages throughout.
+ *
+ * Used for cloud-only features: HeAR cough analysis, 27B reports,
+ * dashboard, alerts, and as fallback for on-device inference.
  */
+
+import NetInfo from '@react-native-community/netinfo';
 
 const RUNPOD_ENDPOINT_ID = process.env.EXPO_PUBLIC_RUNPOD_ENDPOINT_ID || '';
 const RUNPOD_API_KEY = process.env.EXPO_PUBLIC_RUNPOD_API_KEY || '';
@@ -32,6 +37,12 @@ function sleep(ms) {
 export async function callRunPod(route, data = {}, onProgress = null) {
   if (!RUNPOD_ENDPOINT_ID || !RUNPOD_API_KEY) {
     throw new Error('RunPod not configured. Set EXPO_PUBLIC_RUNPOD_ENDPOINT_ID and EXPO_PUBLIC_RUNPOD_API_KEY.');
+  }
+
+  // Check connectivity before attempting cloud call
+  const net = await NetInfo.fetch();
+  if (!net.isConnected) {
+    throw new Error('No internet connection. This feature requires cloud access.');
   }
 
   const headers = {

@@ -6,9 +6,7 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Colors, Typography, Spacing, BorderRadius, Shadows, SyndromeLabels, AlertLevelConfig } from '../utils/theme';
-import { supabase } from '../services/supabase';
 import { ECOWAS_COUNTRIES, getCountryFlag } from '../utils/geo';
-import api from '../services/api';
 import AlertCard from '../components/AlertCard';
 
 const FILTER_LEVELS = ['all', 'emergency', 'warning', 'watch'];
@@ -24,74 +22,20 @@ export default function AlertsScreen({ navigation }) {
   const [sortBy, setSortBy] = useState('severity');
   const [showCountryFilter, setShowCountryFilter] = useState(false);
 
-  const fetchAlerts = useCallback(async () => {
-    try {
-      // Try Supabase first
-      let query = supabase
-        .from('alerts')
-        .select(`
-          id, created_at, alert_level, syndrome_category,
-          case_count_current_week, case_count_baseline, ratio_to_baseline,
-          trend, weeks_above_threshold, situation_summary,
-          recommended_actions, evidence_summary, country_code,
-          district_id, is_active
-        `)
-        .eq('is_active', true)
-        .order('created_at', { ascending: false });
-
-      if (filterLevel !== 'all') {
-        query = query.eq('alert_level', filterLevel);
-      }
-      if (filterCountry) {
-        query = query.eq('country_code', filterCountry);
-      }
-
-      const { data, error } = await query;
-      if (error) throw error;
-
-      // Enrich with district names
-      const districtIds = [...new Set((data || []).map(a => a.district_id).filter(Boolean))];
-      let districtMap = {};
-      if (districtIds.length > 0) {
-        const { data: districts } = await supabase
-          .from('districts')
-          .select('id, name')
-          .in('id', districtIds);
-        (districts || []).forEach(d => { districtMap[d.id] = d.name; });
-      }
-
-      setAlerts((data || []).map(a => ({
-        ...a,
-        alert_id: a.id,
-        district: districtMap[a.district_id] || 'Unknown District',
-      })));
-    } catch {
-      // Fallback to API then demo data
-      try {
-        const res = await api.getAlerts();
-        setAlerts(res?.alerts || DEMO_ALERTS);
-      } catch {
-        setAlerts(DEMO_ALERTS);
-      }
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
+  const fetchAlerts = useCallback(() => {
+    let filtered = DEMO_ALERTS;
+    if (filterLevel !== 'all') {
+      filtered = filtered.filter(a => a.alert_level === filterLevel);
     }
+    if (filterCountry) {
+      filtered = filtered.filter(a => a.country_code === filterCountry);
+    }
+    setAlerts(filtered);
+    setLoading(false);
+    setRefreshing(false);
   }, [filterLevel, filterCountry]);
 
   useEffect(() => { fetchAlerts(); }, [fetchAlerts]);
-
-  // Realtime subscription
-  useEffect(() => {
-    const sub = supabase
-      .channel('alerts-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'alerts' }, () => {
-        fetchAlerts();
-      })
-      .subscribe();
-
-    return () => { supabase.removeChannel(sub); };
-  }, [fetchAlerts]);
 
   const onRefresh = useCallback(() => { setRefreshing(true); fetchAlerts(); }, [fetchAlerts]);
 
@@ -215,10 +159,16 @@ export default function AlertsScreen({ navigation }) {
 }
 
 const DEMO_ALERTS = [
-  { alert_id: 'a1', alert_level: 'emergency', syndrome_category: 'acute_watery_diarrhea', district: 'Kintampo North', country_code: 'GH', case_count_current_week: 25, case_count_baseline: 5.2, ratio_to_baseline: 4.81, trend: 'increasing', weeks_above_threshold: 3, situation_summary: 'Significant cluster of acute watery diarrhea. 25 cases this week represent a nearly 5-fold increase above baseline. Pattern consistent with possible cholera outbreak.', recommended_actions: ['Deploy rapid diagnostic testing', 'Activate oral rehydration stations', 'Investigate water sources', 'Alert neighboring districts'] },
-  { alert_id: 'a2', alert_level: 'warning', syndrome_category: 'acute_hemorrhagic_fever', district: 'Bolgatanga', country_code: 'GH', case_count_current_week: 3, case_count_baseline: 0.5, ratio_to_baseline: 6.0, trend: 'increasing', weeks_above_threshold: 1, situation_summary: 'Three cases of hemorrhagic fever. Two are healthcare workers.', recommended_actions: ['Case investigation with contact tracing', 'Infection control measures', 'Collect specimens for lab confirmation'] },
-  { alert_id: 'a3', alert_level: 'warning', syndrome_category: 'acute_rash_fever', district: 'Tamale Metro', country_code: 'GH', case_count_current_week: 12, case_count_baseline: 3.0, ratio_to_baseline: 4.0, trend: 'increasing', weeks_above_threshold: 2, situation_summary: 'Measles-like illness cluster in unvaccinated children aged 1-5.', recommended_actions: ['Laboratory confirmation', 'Ring vaccination campaign', 'Enhanced school surveillance'] },
-  { alert_id: 'a4', alert_level: 'watch', syndrome_category: 'acute_respiratory_infection', district: 'Wa Municipal', country_code: 'GH', case_count_current_week: 18, case_count_baseline: 12.0, ratio_to_baseline: 1.5, trend: 'stable', weeks_above_threshold: 1, situation_summary: 'Moderate increase in respiratory infections. Likely seasonal.', recommended_actions: ['Continue routine surveillance', 'Monitor for SARI cases'] },
+  { alert_id: 'a1', alert_level: 'emergency', syndrome_category: 'acute_watery_diarrhea', district: 'Kintampo North', country_code: 'GH', case_count_current_week: 25, case_count_baseline: 5.2, ratio_to_baseline: 4.81, trend: 'increasing', weeks_above_threshold: 3, situation_summary: 'Significant cluster of acute watery diarrhea. 25 cases this week — nearly 5× above baseline. Pattern consistent with possible cholera outbreak. Water source contamination suspected in 2 communities.', recommended_actions: ['Deploy rapid diagnostic testing', 'Activate oral rehydration stations', 'Investigate water sources', 'Alert neighboring districts', 'Mobilize community health workers'] },
+  { alert_id: 'a2', alert_level: 'emergency', syndrome_category: 'acute_hemorrhagic_fever', district: 'Maiduguri Metro', country_code: 'NG', case_count_current_week: 8, case_count_baseline: 0.8, ratio_to_baseline: 10.0, trend: 'increasing', weeks_above_threshold: 2, situation_summary: 'Lassa fever cluster confirmed. 8 cases this week including 3 healthcare workers. One fatality reported. Contact tracing ongoing across 4 wards.', recommended_actions: ['Activate IHR Emergency Response', 'Strict PPE for all healthcare workers', 'Collect specimens for national reference lab', 'Contact trace all exposures', 'Suspend elective procedures at index facility'] },
+  { alert_id: 'a3', alert_level: 'emergency', syndrome_category: 'acute_meningitis', district: 'Ouagadougou Baskuy', country_code: 'BF', case_count_current_week: 31, case_count_baseline: 4.1, ratio_to_baseline: 7.6, trend: 'increasing', weeks_above_threshold: 2, situation_summary: 'Meningococcal meningitis outbreak in the meningitis belt. 31 suspected cases; 4 deaths. Attack rate highest in children under 5 and adults 15–29. Peak dry season risk.', recommended_actions: ['Mass vaccination with MenAfriVac', 'Reactive vaccination in adjacent districts', 'CSF specimen collection for serotyping', 'Strengthen case management capacity', 'Activate district emergency operations center'] },
+  { alert_id: 'a4', alert_level: 'warning', syndrome_category: 'acute_hemorrhagic_fever', district: 'Bolgatanga Municipal', country_code: 'GH', case_count_current_week: 3, case_count_baseline: 0.5, ratio_to_baseline: 6.0, trend: 'increasing', weeks_above_threshold: 1, situation_summary: 'Three hemorrhagic fever cases — two are healthcare workers at Bolgatanga Regional Hospital. Viral hemorrhagic fever not yet excluded. Specimen sent to Noguchi Memorial Institute.', recommended_actions: ['Full infection prevention and control protocol', 'Case investigation with contact tracing', 'Collect specimens for lab confirmation', 'Notify regional health directorate'] },
+  { alert_id: 'a5', alert_level: 'warning', syndrome_category: 'acute_rash_fever', district: 'Tamale Metro', country_code: 'GH', case_count_current_week: 12, case_count_baseline: 3.0, ratio_to_baseline: 4.0, trend: 'increasing', weeks_above_threshold: 2, situation_summary: 'Measles-like illness cluster in unvaccinated children aged 1–5 in Tamale. School-based transmission suspected. Last confirmed measles outbreak in this district was 2021.', recommended_actions: ['Laboratory confirmation (IgM serology)', 'Ring vaccination campaign', 'Enhanced surveillance in schools and markets', 'Engage community health nurses'] },
+  { alert_id: 'a6', alert_level: 'warning', syndrome_category: 'acute_jaundice_syndrome', district: 'Dakar Plateau', country_code: 'SN', case_count_current_week: 7, case_count_baseline: 1.2, ratio_to_baseline: 5.8, trend: 'increasing', weeks_above_threshold: 1, situation_summary: 'Yellow fever-compatible cases in unvaccinated adults. Urban yellow fever transmission is a public health emergency. Port-of-entry screening advised given Dakar international hub status.', recommended_actions: ['Immediate yellow fever serology', 'Emergency vaccination of unvaccinated residents', 'Vector control — Aedes aegypti breeding site removal', 'Notify WHO Regional Office for Africa'] },
+  { alert_id: 'a7', alert_level: 'warning', syndrome_category: 'acute_rash_fever', district: 'Kano Municipal', country_code: 'NG', case_count_current_week: 19, case_count_baseline: 5.5, ratio_to_baseline: 3.5, trend: 'increasing', weeks_above_threshold: 2, situation_summary: 'Mpox (monkeypox) cluster with 19 confirmed/probable cases. Skin lesions consistent with mpox clade II. Majority are adults aged 18–35. No pediatric deaths to date.', recommended_actions: ['Notify NCDC Nigeria', 'Contact tracing of all sexual and household contacts', 'JYNNEOS vaccine for close contacts if available', 'Safe burial protocols for any fatalities', 'Risk communication to high-risk groups'] },
+  { alert_id: 'a8', alert_level: 'watch', syndrome_category: 'acute_respiratory_infection', district: 'Wa Municipal', country_code: 'GH', case_count_current_week: 18, case_count_baseline: 12.0, ratio_to_baseline: 1.5, trend: 'stable', weeks_above_threshold: 1, situation_summary: 'Moderate increase in acute respiratory infections likely linked to harmattan dust season. No severe acute respiratory illness (SARI) cases identified. Situation is being monitored.', recommended_actions: ['Continue routine surveillance', 'Screen for SARI in health facilities', 'Advise mask use during heavy dust periods'] },
+  { alert_id: 'a9', alert_level: 'watch', syndrome_category: 'malaria', district: 'Conakry Ratoma', country_code: 'GN', case_count_current_week: 340, case_count_baseline: 210.0, ratio_to_baseline: 1.62, trend: 'increasing', weeks_above_threshold: 3, situation_summary: 'Malaria cases 62% above seasonal baseline following late rains and flooding of low-lying areas. Children under 5 and pregnant women most affected. Bed net distribution incomplete in peri-urban zones.', recommended_actions: ['Accelerate insecticide-treated net distribution', 'Increase artemisinin-based combination therapy stocks', 'Indoor residual spraying in high-burden wards', 'Community sensitization on care-seeking'] },
+  { alert_id: 'a10', alert_level: 'watch', syndrome_category: 'acute_watery_diarrhea', district: 'Freetown Western Urban', country_code: 'SL', case_count_current_week: 44, case_count_baseline: 29.0, ratio_to_baseline: 1.52, trend: 'stable', weeks_above_threshold: 2, situation_summary: 'Elevated diarrheal disease following flooding in Freetown peri-urban areas. Piped water supply disrupted in 3 wards. WASH assessments underway. No cholera confirmed yet.', recommended_actions: ['Water quality testing in affected wards', 'Chlorination of emergency water supplies', 'Deploy oral rehydration therapy kits', 'Prepare for potential cholera response if confirmed'] },
 ];
 
 const styles = StyleSheet.create({

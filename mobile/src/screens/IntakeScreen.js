@@ -6,14 +6,31 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AudioModule, RecordingPresets, useAudioRecorder } from 'expo-audio';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
+import { ExpoSpeechRecognitionModule, useSpeechRecognitionEvent } from 'expo-speech-recognition';
 import * as ImagePicker from 'expo-image-picker';
+import * as DocumentPicker from 'expo-document-picker';
 import * as Haptics from 'expo-haptics';
 import { Colors, Typography, Spacing, BorderRadius, Shadows, SyndromeLabels } from '../utils/theme';
 import api from '../services/api';
-import { supabase } from '../services/supabase';
+import { queueEncounter } from '../services/offlineQueue';
 import GeoPickerCascade from '../components/GeoPickerCascade';
 import FusionCard from '../components/FusionCard';
+
+// WAV/LPCM preset — required for the on-device mel spectrogram pipeline (HeAR)
+const COUGH_WAV_PRESET = {
+  ...RecordingPresets.HIGH_QUALITY,
+  ios: {
+    ...RecordingPresets.HIGH_QUALITY.ios,
+    extension: '.wav',
+    outputFormat: 'lpcm',
+    sampleRate: 16000,
+    numberOfChannels: 1,
+    linearPCMBitDepth: 16,
+    linearPCMIsBigEndian: false,
+    linearPCMIsFloat: false,
+  },
+};
 
 export default function IntakeScreen() {
   const insets = useSafeAreaInsets();
@@ -23,13 +40,11 @@ export default function IntakeScreen() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
 
-  // MedASR recording state
+  // Voice recording state (expo-speech-recognition — on-device STT)
   const [isRecording, setIsRecording] = useState(false);
   const [recordingDuration, setRecordingDuration] = useState(0);
-  const [isTranscribing, setIsTranscribing] = useState(false);
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const durationInterval = useRef(null);
-  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
 
   // MedSigLIP image state
   const [imageUri, setImageUri] = useState(null);
@@ -38,12 +53,28 @@ export default function IntakeScreen() {
 
   // HeAR cough state
   const [coughResult, setCoughResult] = useState(null);
+  const [coughAudioUri, setCoughAudioUri] = useState(null);
   const [showCoughModal, setShowCoughModal] = useState(false);
   const [coughCountdown, setCoughCountdown] = useState(0);
   const [isCoughRecording, setIsCoughRecording] = useState(false);
   const [isAnalyzingCough, setIsAnalyzingCough] = useState(false);
-  const coughRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const coughRecorder = useAudioRecorder(COUGH_WAV_PRESET);
   const coughTimer = useRef(null);
+
+  // Model swap state — shows fullscreen overlay during MedGemma ↔ HeAR swap
+  const [modelSwapState, setModelSwapState] = useState(null); // null | 'switching_to_cough' | 'analyzing' | 'switching_back'
+
+  // On-device speech recognition events
+  useSpeechRecognitionEvent('start', () => setIsRecording(true));
+  useSpeechRecognitionEvent('end', () => setIsRecording(false));
+  useSpeechRecognitionEvent('result', (event) => {
+    const transcript = event.results?.[0]?.transcript;
+    if (transcript) { setNarrative(transcript); setResult(null); }
+  });
+  useSpeechRecognitionEvent('error', (event) => {
+    setIsRecording(false);
+    Alert.alert('Voice Input', event.message || 'Speech recognition failed. Please try again.');
+  });
 
   // Pulse animation for recording indicator
   useEffect(() => {
@@ -71,50 +102,29 @@ export default function IntakeScreen() {
     }
   }, [isRecording]);
 
-  // ─── Voice (MedASR) ───
+  // ─── Voice (on-device STT via expo-speech-recognition) ───
   const startRecording = async () => {
     try {
-      const perm = await AudioModule.requestRecordingPermissionsAsync();
-      if (!perm.granted) {
+      const { granted } = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+      if (!granted) {
         Alert.alert('Permission Required', 'Microphone access is needed for voice input.');
         return;
       }
-      await AudioModule.setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-      recorder.record();
-      setIsRecording(true);
+      ExpoSpeechRecognitionModule.start({
+        lang: 'en-US',
+        interimResults: true,
+        requiresOnDeviceRecognition: true,
+      });
       setRecordingDuration(0);
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     } catch (e) {
-      Alert.alert('Recording Error', e.message);
+      Alert.alert('Voice Input Error', e.message);
     }
   };
 
-  const stopRecording = async () => {
-    try {
-      await recorder.stop();
-      setIsRecording(false);
-      await AudioModule.setAudioModeAsync({ allowsRecording: false });
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-
-      const uri = recorder.uri;
-      if (!uri) return;
-
-      setIsTranscribing(true);
-      try {
-        const base64Audio = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
-        const res = await api.transcribeAudio(base64Audio, 'm4a');
-        setNarrative(res.transcription);
-        setResult(null);
-      } catch {
-        setNarrative('Patient is a 32-year-old female presenting with three days of profuse watery diarrhea and vomiting. Reports severe dehydration with sunken eyes and poor skin turgor. Two neighbors in the same compound have similar symptoms since last week.');
-        setResult(null);
-      } finally {
-        setIsTranscribing(false);
-      }
-    } catch (e) {
-      setIsRecording(false);
-      Alert.alert('Recording Error', e.message);
-    }
+  const stopRecording = () => {
+    ExpoSpeechRecognitionModule.stop();
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   };
 
   // ─── Cough (HeAR) ───
@@ -137,6 +147,7 @@ export default function IntakeScreen() {
   const startCoughRecording = async () => {
     try {
       await AudioModule.setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      await coughRecorder.prepareToRecordAsync();
       coughRecorder.record();
       setIsCoughRecording(true);
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
@@ -160,26 +171,70 @@ export default function IntakeScreen() {
 
       const uri = coughRecorder.uri;
       if (!uri) { setShowCoughModal(false); return; }
+      setCoughAudioUri(uri);
+
+      // Verify recording file exists before reading
+      const fileInfo = await FileSystem.getInfoAsync(uri);
+      if (!fileInfo.exists) {
+        Alert.alert('Recording Error', 'Cough recording was not saved. Please try again.');
+        setShowCoughModal(false);
+        return;
+      }
 
       setIsAnalyzingCough(true);
+      setShowCoughModal(false);
+      setModelSwapState('switching_to_cough');
       try {
         const base64Audio = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
-        const res = await api.analyzeCough(base64Audio, 'm4a');
+        const format = uri.toLowerCase().endsWith('.wav') ? 'wav' : 'm4a';
+        const analysisTimeout = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Analysis timed out. Check your internet connection and try again.')), 60000)
+        );
+        const res = await Promise.race([
+          api.analyzeCough(base64Audio, format, (progressMsg) => {
+            if (progressMsg?.includes('Analyzing')) setModelSwapState('analyzing');
+          }),
+          analysisTimeout,
+        ]);
         setCoughResult(res);
-      } catch {
-        setCoughResult({
-          classification: 'cough_detected',
-          confidence: 0.82,
-          spectrogram_base64: '',
-          syndrome_mapping: 'acute_respiratory_infection',
-        });
+      } catch (err) {
+        Alert.alert('Cough Analysis', err.message || 'Cloud analysis failed. Check internet connection.');
       } finally {
         setIsAnalyzingCough(false);
-        setShowCoughModal(false);
+        setModelSwapState(null);
       }
     } catch (e) {
       setIsCoughRecording(false);
       setShowCoughModal(false);
+      Alert.alert('Error', e.message);
+    }
+  };
+
+  const pickCoughFile = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['audio/*'],
+        copyToCacheDirectory: true,
+      });
+      if (result.canceled) return;
+      const asset = result.assets[0];
+      setIsAnalyzingCough(true);
+      try {
+        const base64 = await FileSystem.readAsStringAsync(
+          asset.uri.replace('file://', ''),
+          { encoding: FileSystem.EncodingType.Base64 }
+        );
+        const ext = asset.name?.split('.').pop()?.toLowerCase() || 'wav';
+        const format = ['m4a', 'aac', 'mp4', 'mp3'].includes(ext) ? ext : 'wav';
+        const res = await api.analyzeCough(base64, format);
+        setCoughResult(res);
+        setCoughAudioUri(asset.uri);
+      } catch (err) {
+        Alert.alert('Upload Failed', err.message || 'Could not analyze audio file.');
+      } finally {
+        setIsAnalyzingCough(false);
+      }
+    } catch (e) {
       Alert.alert('Error', e.message);
     }
   };
@@ -217,17 +272,9 @@ export default function IntakeScreen() {
       try {
         const res = await api.classifyImage(asset.base64, narrative || null);
         setImageResult(res);
-      } catch {
-        setImageResult({
-          classifications: [
-            { pattern: 'measles_rash', score: 0.78, syndrome: 'acute_rash_fever', reportable: true },
-            { pattern: 'chickenpox_rash', score: 0.45, syndrome: 'acute_rash_fever', reportable: false },
-            { pattern: 'hemorrhagic_signs', score: 0.22, syndrome: 'acute_hemorrhagic_fever', reportable: true },
-            { pattern: 'healthy_normal', score: 0.15, syndrome: null, reportable: false },
-          ],
-          top_pattern: 'measles_rash',
-          flagged: true,
-        });
+      } catch (err) {
+        Alert.alert('Image Triage', err.message || 'MedSigLIP analysis failed. Check RunPod connection.');
+        setImageUri(null);
       } finally {
         setIsClassifying(false);
       }
@@ -237,9 +284,11 @@ export default function IntakeScreen() {
   };
 
   // ─── Submit ───
+  const [savedToDistrict, setSavedToDistrict] = useState(null); // name of district after save
+
   const handleSubmit = async () => {
     if (!narrative.trim()) { Alert.alert('Missing Information', 'Please enter a clinical narrative.'); return; }
-    setLoading(true); setResult(null);
+    setLoading(true); setResult(null); setSavedToDistrict(null);
     try {
       const res = await api.submitEncounter({
         narrative: narrative.trim(),
@@ -247,32 +296,38 @@ export default function IntakeScreen() {
         facilityName: 'Mobile Field Unit',
       });
       setResult(res);
-
-      // Write to Supabase
-      try {
-        await supabase.from('encounters').insert({
-          narrative_text: narrative.trim(),
-          district_id: geoSelection.district_id || null,
-          facility_id: null,
-          syndromic_signal: res.syndromic_signal || null,
-          syndrome_category: res.syndromic_signal?.syndrome_category || null,
-          severity: res.syndromic_signal?.severity || null,
-          symptoms: res.syndromic_signal?.symptoms || [],
-          icd10_codes: res.syndromic_signal?.icd10_codes || [],
-          confidence_score: res.syndromic_signal?.confidence_score || null,
-          reportable_conditions: res.syndromic_signal?.reportable_conditions_flagged || [],
-          cluster_indicator: res.syndromic_signal?.cluster_indicator || false,
-          cough_analysis: coughResult || null,
-          image_analysis: imageResult || null,
-          image_url: imageUri || null,
-        });
-      } catch { /* Supabase write failure is non-blocking */ }
-    } catch {
-      setResult(generateDemoResult(narrative));
+    } catch (err) {
+      Alert.alert('Extraction Failed', err.message || 'On-device AI failed. Please try again.');
     } finally { setLoading(false); scrollRef.current?.scrollToEnd({ animated: true }); }
   };
 
-  const loadExample = (ex) => { setNarrative(ex); setResult(null); };
+  const handleSaveToDistrict = async () => {
+    if (!geoSelection.district_id) {
+      Alert.alert('Select District', 'Please select a district using the Location picker above before saving.');
+      return;
+    }
+    if (!result?.syndromic_signal) {
+      Alert.alert('No Data', 'Please extract syndromic signals first.');
+      return;
+    }
+    try {
+      await queueEncounter({
+        narrative: narrative.trim(),
+        extraction: result.syndromic_signal,
+        districtId: geoSelection.district_id,
+        location: { name: geoSelection.district_name },
+        coughResult: coughResult || null,
+        imageResult: imageResult || null,
+        imageUri: imageUri || null,
+        coughAudioUri: coughAudioUri || null,
+      });
+      setSavedToDistrict(geoSelection.district_name || 'District');
+    } catch {
+      Alert.alert('Save Failed', 'Could not save encounter. It will be retried automatically.');
+    }
+  };
+
+  const loadExample = (ex) => { setNarrative(ex); setResult(null); setSavedToDistrict(null); };
 
   const hasMultipleModalities = [result?.syndromic_signal, coughResult, imageResult].filter(Boolean).length >= 2;
 
@@ -306,6 +361,7 @@ export default function IntakeScreen() {
               <Text style={styles.modalityLabel}>Cough</Text>
               <Text style={styles.modalityModel}>HeAR</Text>
               {coughResult && <Ionicons name="checkmark-circle" size={14} color={Colors.success} style={{ marginTop: 2 }} />}
+              {isAnalyzingCough && <ActivityIndicator size="small" color={Colors.accent.primary} style={{ marginTop: 2 }} />}
             </TouchableOpacity>
 
             <TouchableOpacity style={[styles.modalityBtn, imageResult && styles.modalityBtnDone]} onPress={pickImage}>
@@ -318,13 +374,11 @@ export default function IntakeScreen() {
             </TouchableOpacity>
           </View>
 
-          {/* Transcribing indicator */}
-          {isTranscribing && (
-            <View style={styles.processingCard}>
-              <ActivityIndicator size="small" color={Colors.accent.primary} />
-              <Text style={styles.processingText}>Transcribing with MedASR...</Text>
-            </View>
-          )}
+          {/* Upload pre-recorded cough audio */}
+          <TouchableOpacity style={styles.uploadAudioLink} onPress={pickCoughFile} disabled={isAnalyzingCough}>
+            <Ionicons name="cloud-upload-outline" size={13} color={Colors.accent.primaryDark} />
+            <Text style={styles.uploadAudioText}>Upload cough recording from library</Text>
+          </TouchableOpacity>
 
           {/* Narrative Input */}
           <View style={styles.inputCard}>
@@ -369,6 +423,7 @@ export default function IntakeScreen() {
               <Text style={styles.coughBadgeText}>
                 HeAR: {(coughResult.classification || coughResult.prediction || '').replace(/_/g, ' ')} ({Math.round((coughResult.confidence || 0) * 100)}%)
               </Text>
+              <SourceBadge source={coughResult._source} />
               <TouchableOpacity onPress={() => setCoughResult(null)}>
                 <Ionicons name="close-circle" size={16} color={Colors.text.tertiary} />
               </TouchableOpacity>
@@ -413,6 +468,7 @@ export default function IntakeScreen() {
               <View style={styles.resultHeader}>
                 <Ionicons name="checkmark-circle" size={18} color={Colors.success} />
                 <Text style={styles.resultTitle}>Syndromic Signal Extracted</Text>
+                <SourceBadge source={result.syndromic_signal._source} model={result.syndromic_signal._model} />
               </View>
               <View style={styles.resultCard}>
                 <Row label="Syndrome">
@@ -480,6 +536,24 @@ export default function IntakeScreen() {
               )}
             </View>
           )}
+
+          {/* Save to District Button */}
+          {result?.syndromic_signal && !savedToDistrict && (
+            <TouchableOpacity style={styles.saveBtn} onPress={handleSaveToDistrict}>
+              <Ionicons name="cloud-upload" size={18} color="#fff" />
+              <Text style={styles.saveBtnText}>
+                Save to {geoSelection.district_name || 'District'} Database
+              </Text>
+            </TouchableOpacity>
+          )}
+
+          {/* Success Banner */}
+          {savedToDistrict && (
+            <View style={styles.successBanner}>
+              <Ionicons name="checkmark-circle" size={18} color={Colors.success} />
+              <Text style={styles.successText}>Saved to {savedToDistrict}</Text>
+            </View>
+          )}
         </ScrollView>
       </KeyboardAvoidingView>
 
@@ -512,7 +586,7 @@ export default function IntakeScreen() {
               onPress={() => {
                 clearInterval(coughTimer.current);
                 if (isCoughRecording) {
-                  coughRecorder.stop().catch(() => {});
+                  coughRecorder.stop().catch(() => { });
                 }
                 setIsCoughRecording(false);
                 setShowCoughModal(false);
@@ -523,12 +597,52 @@ export default function IntakeScreen() {
           </View>
         </View>
       </Modal>
+
+      {/* Cough Analysis Loading Overlay — absoluteFill View avoids iOS Modal ghost touch layer */}
+      {!!modelSwapState && (
+        <View style={[StyleSheet.absoluteFill, styles.swapOverlay]}>
+          <View style={styles.swapCard}>
+            <ActivityIndicator size="large" color={Colors.accent.primary} />
+            <Text style={styles.swapTitle}>
+              {modelSwapState === 'switching_to_cough'
+                ? 'Sending to HeAR cloud...'
+                : 'Analyzing cough biomarkers...'}
+            </Text>
+            <Text style={styles.swapSubtitle}>
+              {modelSwapState === 'switching_to_cough'
+                ? 'Uploading your cough recording for analysis'
+                : 'HeAR is processing your cough recording'}
+            </Text>
+            <TouchableOpacity
+              style={[styles.coughCancelBtn, { marginTop: 16 }]}
+              onPress={() => { setModelSwapState(null); setIsAnalyzingCough(false); }}
+            >
+              <Text style={styles.coughCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
 
 function Row({ label, children }) {
   return <View style={styles.row}><Text style={styles.rowLabel}>{label}</Text>{children}</View>;
+}
+
+function SourceBadge({ source, model }) {
+  const cfg = {
+    'on-device': { icon: 'phone-portrait', color: Colors.success, label: 'On-Device' },
+    'cloud': { icon: 'cloud', color: Colors.accent.primary, label: 'Cloud AI' },
+    'demo': { icon: 'alert-circle', color: Colors.severity.watch, label: 'Demo Mode' },
+  }[source] || { icon: 'help-circle', color: Colors.text.tertiary, label: 'Unknown' };
+
+  return (
+    <View style={[styles.sourceBadge, { borderColor: cfg.color + '40', backgroundColor: cfg.color + '12' }]}>
+      <Ionicons name={cfg.icon} size={11} color={cfg.color} />
+      <Text style={[styles.sourceBadgeText, { color: cfg.color }]}>{cfg.label}</Text>
+    </View>
+  );
 }
 
 function sevColor(s) {
@@ -548,7 +662,7 @@ function generateDemoResult(narrative) {
   else if (l.includes('rash') && l.includes('fever')) { syn = 'acute_rash_fever'; symp = ['maculopapular_rash', 'fever', 'cough', 'conjunctivitis']; icd = ['B05']; rep = ['measles']; }
   else if (l.includes('bleeding') || l.includes('hemorrhag')) { syn = 'acute_hemorrhagic_fever'; symp = ['fever', 'unexplained_bleeding', 'petechiae']; icd = ['A98']; rep = ['hemorrhagic_fever_suspect']; sev = 'severe'; }
   if (l.includes('neighbor') || l.includes('multiple') || l.includes('school')) clust = true;
-  return { encounter_id: Math.random().toString(36).substr(2, 8), timestamp: new Date().toISOString(), syndromic_signal: { symptoms: symp, syndrome_category: syn, severity: sev, age_group: 'adult', icd10_codes: icd, reportable_conditions_flagged: rep, cluster_indicator: clust, confidence_score: 0.89 } };
+  return { encounter_id: Math.random().toString(36).substr(2, 8), timestamp: new Date().toISOString(), syndromic_signal: { symptoms: symp, syndrome_category: syn, severity: sev, age_group: 'adult', icd10_codes: icd, reportable_conditions_flagged: rep, cluster_indicator: clust, confidence_score: 0.89, _source: 'demo', _model: 'keyword-template' } };
 }
 
 const styles = StyleSheet.create({
@@ -578,6 +692,8 @@ const styles = StyleSheet.create({
   modalityLabel: { fontSize: 13, fontWeight: '600', color: Colors.text.primary },
   modalityModel: { fontSize: 10, color: Colors.text.tertiary, marginTop: 1 },
   recordingBadge: { fontSize: 11, fontWeight: '700', color: Colors.severity.emergency, marginTop: 4 },
+  uploadAudioLink: { flexDirection: 'row', alignItems: 'center', gap: 5, alignSelf: 'center', paddingVertical: 6, marginBottom: 4 },
+  uploadAudioText: { fontSize: 12, color: Colors.accent.primaryDark },
 
   inputCard: { backgroundColor: Colors.bg.card, borderRadius: BorderRadius.xl, borderWidth: 1, borderColor: Colors.border, marginBottom: 12, ...Shadows.sm },
   textInput: { padding: 16, fontSize: 14, color: Colors.text.primary, minHeight: 140, lineHeight: 20 },
@@ -603,9 +719,16 @@ const styles = StyleSheet.create({
   submitBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: Colors.accent.primaryDark, borderRadius: BorderRadius.md, paddingVertical: 14, gap: 8, ...Shadows.md },
   submitBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
 
+  saveBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: '#2563EB', borderRadius: BorderRadius.md, paddingVertical: 14, gap: 8, marginTop: 16, ...Shadows.md },
+  saveBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  successBanner: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: Colors.success + '12', borderRadius: BorderRadius.md, paddingVertical: 12, marginTop: 12, borderWidth: 1, borderColor: Colors.success + '30' },
+  successText: { fontSize: 14, fontWeight: '600', color: Colors.success },
+
   resultContainer: { marginTop: 24 },
   resultHeader: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 10 },
-  resultTitle: { fontSize: 15, fontWeight: '600', color: Colors.success },
+  resultTitle: { fontSize: 15, fontWeight: '600', color: Colors.success, flex: 1 },
+  sourceBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, borderWidth: 1, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3 },
+  sourceBadgeText: { fontSize: 10, fontWeight: '600' },
 
   resultCard: { backgroundColor: Colors.bg.card, borderRadius: BorderRadius.xl, padding: 16, borderWidth: 1, borderColor: Colors.border, ...Shadows.sm },
   row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: Colors.divider },
@@ -644,4 +767,10 @@ const styles = StyleSheet.create({
   coughRecordingSub: { fontSize: 12, color: Colors.text.tertiary, marginTop: 4 },
   coughCancelBtn: { paddingVertical: 10, paddingHorizontal: 24 },
   coughCancelText: { fontSize: 14, color: Colors.text.secondary },
+
+  // Model swap overlay
+  swapOverlay: { flex: 1, backgroundColor: Colors.overlay, justifyContent: 'center', alignItems: 'center' },
+  swapCard: { backgroundColor: Colors.bg.primary, borderRadius: BorderRadius['2xl'], padding: 36, width: 300, alignItems: 'center', ...Shadows.lg },
+  swapTitle: { fontSize: 16, fontWeight: '600', color: Colors.text.primary, marginTop: 20, textAlign: 'center' },
+  swapSubtitle: { fontSize: 13, color: Colors.text.secondary, marginTop: 8, textAlign: 'center', lineHeight: 18 },
 });

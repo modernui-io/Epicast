@@ -78,13 +78,28 @@ def load_hear():
 
 
 def audio_to_mel_spectrogram(audio_bytes):
-    """Convert raw audio bytes to mel spectrogram matching HeAR's expected input."""
+    """Convert raw audio bytes to mel spectrogram matching HeAR's expected input.
+    Supports WAV/FLAC via soundfile; falls back to librosa for M4A/MP3/AAC/etc."""
     import librosa
     import io
     import soundfile as sf
 
-    # Load audio
-    audio_data, sr = sf.read(io.BytesIO(audio_bytes))
+    # Try soundfile first (fast path: WAV, FLAC)
+    try:
+        audio_data, sr = sf.read(io.BytesIO(audio_bytes))
+    except Exception:
+        # Fallback: write to temp file and use librosa (handles M4A, MP3, AAC via Core Audio on Mac)
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.audio', delete=False) as f:
+            f.write(audio_bytes)
+            tmp_path = f.name
+        try:
+            audio_data, sr = librosa.load(tmp_path, sr=None, mono=True)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     # Convert to mono if stereo
     if len(audio_data.shape) > 1:
@@ -237,52 +252,69 @@ def hear_embed():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/v1/report/generate", methods=["POST"])
-def generate_report():
-    """
-    Proxy to llama.cpp server for MedGemma 27B situation reports.
-    Accepts: JSON {prompt, system_prompt?, max_tokens?}
-    Returns: {text, tokens_used}
-    """
+import threading, uuid as _uuid
+_report_jobs = {}  # job_id -> {status, text?, tokens_used?, error?}
+
+def _run_report_job(job_id, prompt, system_prompt, max_tokens):
     import urllib.request
-
-    data = request.json or {}
-    prompt = data.get("prompt", "")
-    system_prompt = data.get("system_prompt", "You are EpiCast, an epidemiological surveillance AI.")
-    max_tokens = data.get("max_tokens", 2048)
-
-    if not prompt:
-        return jsonify({"error": "No prompt provided"}), 400
-
-    # Build llama.cpp compatible request
-    llama_payload = json.dumps({
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.3,
-        "stream": False,
-    }).encode("utf-8")
-
     try:
+        llama_payload = json.dumps({
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+            "stream": False,
+        }).encode("utf-8")
         req = urllib.request.Request(
             f"{LLAMA_SERVER_URL}/v1/chat/completions",
             data=llama_payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=600) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-
         text = result["choices"][0]["message"]["content"]
         tokens = result.get("usage", {}).get("total_tokens", 0)
-
-        return jsonify({"text": text, "tokens_used": tokens})
-
+        _report_jobs[job_id] = {"status": "done", "text": text, "tokens_used": tokens}
     except Exception as e:
-        log.error(f"llama.cpp proxy error: {e}", exc_info=True)
-        return jsonify({"error": f"llama.cpp server error: {e}"}), 502
+        log.error(f"Report job {job_id} failed: {e}", exc_info=True)
+        _report_jobs[job_id] = {"status": "error", "error": str(e)}
+
+
+@app.route("/v1/report/generate", methods=["POST"])
+def generate_report():
+    """
+    Async report generation — returns job_id immediately.
+    Poll /v1/report/status/<job_id> until status == 'done'.
+    Accepts: JSON {prompt, system_prompt?, max_tokens?}
+    Returns: {job_id, status: 'pending'}
+    """
+    data = request.json or {}
+    prompt = data.get("prompt", "")
+    system_prompt = data.get("system_prompt", "You are EpiCast, an epidemiological surveillance AI.")
+    max_tokens = data.get("max_tokens", 128)
+
+    if not prompt:
+        return jsonify({"error": "No prompt provided"}), 400
+
+    job_id = str(_uuid.uuid4())[:8]
+    _report_jobs[job_id] = {"status": "pending"}
+    threading.Thread(target=_run_report_job,
+                     args=(job_id, prompt, system_prompt, max_tokens),
+                     daemon=True).start()
+    log.info(f"Report job {job_id} started")
+    return jsonify({"job_id": job_id, "status": "pending"})
+
+
+@app.route("/v1/report/status/<job_id>", methods=["GET"])
+def report_status(job_id):
+    """Poll for report job result."""
+    job = _report_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
 
 
 # ============================================================
