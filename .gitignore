@@ -17,9 +17,10 @@ dist/
 # macOS
 .DS_Store
 
-# Environment
+# Environment & secrets
 .env
 .env.local
+start_tunnel.sh
 
 # Python
 __pycache__/
